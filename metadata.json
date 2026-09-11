@@ -1,0 +1,6 @@
+{
+  "name": "LinkManager.in",
+  "description": "All your links in one place. Bookmark, organize, and access links across categories with Firebase authentication.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
