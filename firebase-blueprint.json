@@ -1,0 +1,75 @@
+{
+  "entities": {
+    "LinkItem": {
+      "title": "LinkItem",
+      "description": "A saved bookmark link belonging to a user",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Title of the saved bookmark",
+          "maxLength": 200
+        },
+        "url": {
+          "type": "string",
+          "description": "URL destination of the bookmark",
+          "maxLength": 2000
+        },
+        "category": {
+          "type": "string",
+          "description": "Category of the link (Work, Social, Tools, Reading, Personal)",
+          "maxLength": 50
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional notes or summary for the link",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of bookmark creation"
+        },
+        "isPublic": {
+          "type": "boolean",
+          "description": "Whether the bookmark is publicly visible"
+        },
+        "isFavorite": {
+          "type": "boolean",
+          "description": "Whether the bookmark is pinned to the top as a favorite"
+        },
+        "order": {
+          "type": "number",
+          "description": "Manual drag-and-drop sort index"
+        }
+      },
+      "required": ["title", "url", "category", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile and public handle mappings",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "username": { "type": "string", "maxLength": 50 },
+        "displayName": { "type": "string", "maxLength": 100 },
+        "photoURL": { "type": "string", "maxLength": 1000 },
+        "email": { "type": "string", "maxLength": 200 }
+      },
+      "required": ["uid", "username"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/links/{linkId}": {
+      "schema": "LinkItem",
+      "description": "User specific collection of saved bookmarks"
+    },
+    "/usernames/{username}": {
+      "schema": "UserProfile",
+      "description": "Lookup index for public profiles"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User root profile document"
+    }
+  }
+}

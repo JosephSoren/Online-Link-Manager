@@ -4,6 +4,7 @@ export interface LinkItem {
   url: string;
   category: string;
   description?: string;
+  thumbnail?: string;
   createdAt: string;
   userId?: string;
   favorite?: boolean;

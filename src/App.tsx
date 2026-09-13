@@ -12,6 +12,8 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
+  where,
   setDoc,
   deleteDoc,
   updateDoc,
@@ -22,6 +24,7 @@ import {
 } from 'firebase/firestore';
 import { auth, googleProvider, db } from './firebase';
 import jsPDF from 'jspdf';
+import { QrCodeModal } from './components/QrCodeModal';
 
 export interface LinkItem {
   id: string;
@@ -29,9 +32,20 @@ export interface LinkItem {
   url: string;
   category: 'Work' | 'Social' | 'Tools' | 'Reading' | 'Personal' | string;
   description?: string;
+  thumbnail?: string;
   createdAt: string;
   userId?: string;
   isPublic?: boolean;
+  isFavorite?: boolean;
+  order?: number;
+}
+
+export interface PublicUserProfile {
+  username: string;
+  displayName: string;
+  photoURL?: string;
+  email?: string;
+  uid?: string;
 }
 
 const INITIAL_LINKS: LinkItem[] = [
@@ -41,8 +55,10 @@ const INITIAL_LINKS: LinkItem[] = [
     url: 'https://google.com',
     category: 'Tools',
     description: 'Quick web access for inquiries and searching.',
-    createdAt: new Date().toISOString(),
+    createdAt: new Date(Date.now() - 60000).toISOString(),
     isPublic: true,
+    isFavorite: true,
+    order: 0,
   },
   {
     id: '2',
@@ -52,8 +68,74 @@ const INITIAL_LINKS: LinkItem[] = [
     description: 'Source code management and version control.',
     createdAt: new Date().toISOString(),
     isPublic: true,
+    isFavorite: false,
+    order: 1,
   }
 ];
+
+// Default categories
+const DEFAULT_CATEGORIES = ['Work', 'Social', 'Tools', 'Reading', 'Personal'];
+
+// Slugify category for URLs (e.g. "Exam Links" -> "exam-links", "Favorites" -> "favourites")
+const slugifyCategory = (category: string): string => {
+  const c = (category || '').toLowerCase().trim();
+  if (c === 'favourites' || c === 'favorites' || c === 'fav' || c === 'favorite') return 'favourites';
+  if (c === 'all') return 'all';
+  return c.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+};
+
+// Resolve category from slug against available categories
+const resolveCategoryFromSlug = (slug: string, availableCategories: string[]): string => {
+  const clean = (slug || '').toLowerCase().trim();
+  if (clean === 'favourites' || clean === 'favorites' || clean === 'fav' || clean === 'favorite') {
+    return 'Favourites';
+  }
+  if (clean === 'all') return 'All';
+
+  // Direct match by slug
+  const matched = availableCategories.find(
+    (c) => slugifyCategory(c) === clean || c.toLowerCase() === clean.replace(/-/g, ' ') || c.toLowerCase() === clean
+  );
+  if (matched) return matched;
+
+  // Title-case fallback, e.g. "exam-links" -> "Exam Links"
+  return clean
+    .split('-')
+    .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : ''))
+    .join(' ')
+    .trim();
+};
+
+interface ProfileRoute {
+  username: string;
+  categorySlug?: string;
+}
+
+// Helper to extract username & optional category slug from URL
+// Supports: /rohitkumar, /rohitkumar/favourites, /rohitkumar/exam-links, or ?u=rohitkumar&cat=exam-links
+const getProfileRouteFromUrl = (): ProfileRoute | null => {
+  const params = new URLSearchParams(window.location.search);
+  const uParam = params.get('u');
+  const catParam = params.get('cat') || params.get('category');
+  if (uParam) {
+    return {
+      username: uParam.toLowerCase().trim(),
+      categorySlug: catParam ? catParam.toLowerCase().trim() : undefined,
+    };
+  }
+
+  const pathParts = window.location.pathname.replace(/^\/+|\/+$/g, '').split('/');
+  const first = pathParts[0]?.toLowerCase().trim();
+  const reserved = ['', 'index.html', 'api', 'assets', 'dashboard', 'settings'];
+  if (first && !reserved.includes(first)) {
+    const second = pathParts[1]?.toLowerCase().trim();
+    return {
+      username: first,
+      categorySlug: second && !reserved.includes(second) ? second : undefined,
+    };
+  }
+  return null;
+};
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
@@ -63,6 +145,47 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isDarkMode, setIsDarkMode] = useState(false);
 
+  // Custom Categories state (synced with localStorage & Firestore)
+  const [customCategories, setCustomCategories] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('lm_custom_categories');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [showAddCategorySidebar, setShowAddCategorySidebar] = useState(false);
+  const [sidebarCategoryInput, setSidebarCategoryInput] = useState('');
+  const [isAddingCustomCategoryInModal, setIsAddingCustomCategoryInModal] = useState(false);
+  const [modalNewCategoryText, setModalNewCategoryText] = useState('');
+
+  // View Navigation: 'dashboard' | 'settings' | 'public_profile'
+  const [currentView, setCurrentView] = useState<'dashboard' | 'settings' | 'public_profile'>('dashboard');
+  const [isHeaderMenuOpen, setIsHeaderMenuOpen] = useState(false);
+
+  // Drag and drop reordering state
+  const [draggedLinkId, setDraggedLinkId] = useState<string | null>(null);
+  const [dragOverLinkId, setDragOverLinkId] = useState<string | null>(null);
+  const [draggableCardId, setDraggableCardId] = useState<string | null>(null);
+
+  // User Profile & Custom Subfolder Handle (e.g. josephsoren)
+  const [userUsername, setUserUsername] = useState<string>('josephsoren');
+  const [editUsernameInput, setEditUsernameInput] = useState<string>('josephsoren');
+  const [isSavingUsername, setIsSavingUsername] = useState(false);
+
+  // Public Profile Viewing State (for https://linkmanager.in/{username} & /{username}/{category})
+  const [publicProfileUsername, setPublicProfileUsername] = useState<string>('josephsoren');
+  const [publicProfileUser, setPublicProfileUser] = useState<PublicUserProfile | null>(null);
+  const [publicLinks, setPublicLinks] = useState<LinkItem[]>([]);
+  const [publicProfileLoading, setPublicProfileLoading] = useState(false);
+  const [publicCategory, setPublicCategory] = useState<string>('All');
+  const [publicSearch, setPublicSearch] = useState<string>('');
+
+  // Settings view filters
+  const [settingsSearch, setSettingsSearch] = useState<string>('');
+  const [settingsVisibilityFilter, setSettingsVisibilityFilter] = useState<'all' | 'public' | 'private'>('all');
+  const [settingsCategoryFilter, setSettingsCategoryFilter] = useState<string>('All');
+
   // Modals state
   const [isLinkModalOpen, setIsLinkModalOpen] = useState(false);
   const [editingLink, setEditingLink] = useState<LinkItem | null>(null);
@@ -70,7 +193,13 @@ export default function App() {
   const [formUrl, setFormUrl] = useState('');
   const [formCategory, setFormCategory] = useState('Work');
   const [formDescription, setFormDescription] = useState('');
+  const [formThumbnail, setFormThumbnail] = useState('');
+  const [thumbnailStyle, setThumbnailStyle] = useState('modern');
+  const [isGeneratingThumbnail, setIsGeneratingThumbnail] = useState(false);
+  const [thumbnailError, setThumbnailError] = useState<string | null>(null);
+  const [showCustomUrlInput, setShowCustomUrlInput] = useState(false);
   const [formIsPublic, setFormIsPublic] = useState(false);
+  const [formIsFavorite, setFormIsFavorite] = useState(false);
 
   // Delete Confirmation Modal
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -84,6 +213,30 @@ export default function App() {
 
   // Shared Link Viewer (for incoming ?share=... links)
   const [sharedViewerLink, setSharedViewerLink] = useState<LinkItem | null>(null);
+
+  // QR Code Modal State
+  const [isQrModalOpen, setIsQrModalOpen] = useState(false);
+  const [qrModalData, setQrModalData] = useState<{
+    url: string;
+    title: string;
+    subtitle?: string;
+    categoryBadge?: string;
+  }>({
+    url: '',
+    title: '',
+    subtitle: '',
+    categoryBadge: '',
+  });
+
+  const handleOpenQrModal = (
+    url: string,
+    title: string,
+    subtitle?: string,
+    categoryBadge?: string
+  ) => {
+    setQrModalData({ url, title, subtitle, categoryBadge });
+    setIsQrModalOpen(true);
+  };
 
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isLoginMode, setIsLoginMode] = useState(true);
@@ -140,9 +293,12 @@ export default function App() {
               url: data.url || '',
               category: data.category || 'Work',
               description: data.description || '',
+              thumbnail: data.thumbnail || undefined,
               createdAt: data.createdAt || new Date().toISOString(),
               userId: currentUser.uid,
               isPublic: Boolean(data.isPublic),
+              isFavorite: Boolean(data.isFavorite),
+              order: typeof data.order === 'number' ? data.order : undefined,
             });
           });
 
@@ -152,15 +308,18 @@ export default function App() {
             const toSeed: LinkItem[] = localData ? JSON.parse(localData) : INITIAL_LINKS;
 
             const batch = writeBatch(db);
-            toSeed.forEach((item) => {
+            toSeed.forEach((item, idx) => {
               const newRef = doc(collection(db, 'users', currentUser.uid, 'links'));
               batch.set(newRef, {
                 title: item.title,
                 url: item.url,
                 category: item.category,
                 description: item.description || '',
+                thumbnail: item.thumbnail || '',
                 createdAt: item.createdAt || new Date().toISOString(),
                 isPublic: Boolean(item.isPublic),
+                isFavorite: Boolean(item.isFavorite),
+                order: typeof item.order === 'number' ? item.order : idx,
               });
             });
             batch.commit().catch(console.error);
@@ -213,6 +372,7 @@ export default function App() {
                 url: d.url || '',
                 category: d.category || 'Work',
                 description: d.description || '',
+                thumbnail: d.thumbnail || undefined,
                 createdAt: d.createdAt || new Date().toISOString(),
                 userId: shareUid,
                 isPublic: Boolean(d.isPublic),
@@ -225,6 +385,361 @@ export default function App() {
       }
     }
   }, [links]);
+
+  // Sync user profile, handle, and custom categories on auth change
+  useEffect(() => {
+    if (!currentUser) {
+      const storedHandle = localStorage.getItem('lm_username') || 'josephsoren';
+      setUserUsername(storedHandle);
+      setEditUsernameInput(storedHandle);
+      return;
+    }
+
+    const userDocRef = doc(db, 'users', currentUser.uid);
+    getDoc(userDocRef)
+      .then((snap) => {
+        let chosenUsername = '';
+        if (snap.exists()) {
+          const uData = snap.data();
+          if (uData.username) {
+            chosenUsername = uData.username;
+          }
+          if (uData.customCategories && Array.isArray(uData.customCategories)) {
+            setCustomCategories(uData.customCategories);
+            localStorage.setItem('lm_custom_categories', JSON.stringify(uData.customCategories));
+          }
+        }
+
+        if (!chosenUsername) {
+          // Derive from email or displayName
+          const emailPrefix = currentUser.email?.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '') || '';
+          const nameClean = (currentUser.displayName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+          chosenUsername = nameClean || (emailPrefix.startsWith('josephsoren') ? 'josephsoren' : emailPrefix) || 'user';
+
+          // Save username mappings
+          setDoc(
+            userDocRef,
+            {
+              uid: currentUser.uid,
+              email: currentUser.email,
+              displayName: currentUser.displayName || chosenUsername,
+              photoURL: currentUser.photoURL || '',
+              username: chosenUsername,
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          ).catch(console.error);
+
+          setDoc(
+            doc(db, 'usernames', chosenUsername),
+            {
+              uid: currentUser.uid,
+              username: chosenUsername,
+              displayName: currentUser.displayName || chosenUsername,
+              photoURL: currentUser.photoURL || '',
+            },
+            { merge: true }
+          ).catch(console.error);
+        }
+
+        setUserUsername(chosenUsername);
+        setEditUsernameInput(chosenUsername);
+        localStorage.setItem('lm_username', chosenUsername);
+      })
+      .catch((err) => {
+        console.error('Error fetching user profile:', err);
+        setUserUsername('josephsoren');
+        setEditUsernameInput('josephsoren');
+      });
+  }, [currentUser]);
+
+  // Merged dynamic category list (default + custom added categories + any categories in links)
+  const allCategories = useMemo(() => {
+    const set = new Set([...DEFAULT_CATEGORIES, ...customCategories]);
+    links.forEach((l) => {
+      if (l.category && l.category !== 'All' && l.category !== 'Favorites' && l.category !== 'Favourites') {
+        set.add(l.category);
+      }
+    });
+    return Array.from(set);
+  }, [customCategories, links]);
+
+  // Admin add new category
+  const handleAddCategory = async (catName: string) => {
+    const trimmed = catName.trim();
+    if (!trimmed) return;
+    if (
+      allCategories.some((c) => c.toLowerCase() === trimmed.toLowerCase()) ||
+      trimmed.toLowerCase() === 'all' ||
+      trimmed.toLowerCase() === 'favorites' ||
+      trimmed.toLowerCase() === 'favourites'
+    ) {
+      setCopyNotification(`Category "${trimmed}" is already available`);
+      setTimeout(() => setCopyNotification(null), 2000);
+      return trimmed;
+    }
+    const updated = [...customCategories, trimmed];
+    setCustomCategories(updated);
+    localStorage.setItem('lm_custom_categories', JSON.stringify(updated));
+    if (currentUser) {
+      setDoc(doc(db, 'users', currentUser.uid), { customCategories: updated }, { merge: true }).catch(console.error);
+    }
+    setCopyNotification(`Category "${trimmed}" added!`);
+    setTimeout(() => setCopyNotification(null), 2200);
+    return trimmed;
+  };
+
+  const getCategoryShareUrl = (categoryName: string, usernameOverride?: string) => {
+    const targetUser = usernameOverride || userUsername || 'josephsoren';
+    if (categoryName !== 'All') {
+      const slug = slugifyCategory(categoryName);
+      return `${window.location.origin}/${targetUser}/${slug}`;
+    }
+    return `${window.location.origin}/${targetUser}`;
+  };
+
+  const getProfileShareUrl = (usernameOverride?: string) => {
+    const targetUser = usernameOverride || userUsername || 'josephsoren';
+    return `${window.location.origin}/${targetUser}`;
+  };
+
+  // Copy direct category share link (e.g. https://linkmanager.in/rohitkumar/exam-links)
+  const handleCopyCategoryShareUrl = (categoryName: string, usernameOverride?: string) => {
+    const shareUrl = getCategoryShareUrl(categoryName, usernameOverride);
+    navigator.clipboard.writeText(shareUrl).then(() => {
+      setCopyNotification(`Copied category link: ${shareUrl}`);
+      setTimeout(() => setCopyNotification(null), 2500);
+    });
+  };
+
+  // Load public profile with optional initial category slug
+  const loadPublicProfile = async (targetSlug: string, initialCategorySlug?: string) => {
+    setPublicProfileLoading(true);
+    setPublicProfileUsername(targetSlug);
+    try {
+      const usernameSnap = await getDoc(doc(db, 'usernames', targetSlug));
+      let targetUid = '';
+      let profileData: PublicUserProfile = {
+        username: targetSlug,
+        displayName: targetSlug,
+        photoURL: '',
+      };
+
+      if (usernameSnap.exists()) {
+        const uData = usernameSnap.data();
+        targetUid = uData.uid || '';
+        profileData = {
+          username: uData.username || targetSlug,
+          displayName: uData.displayName || targetSlug,
+          photoURL: uData.photoURL || '',
+          email: uData.email || '',
+          uid: targetUid,
+        };
+      } else if (currentUser && (userUsername === targetSlug || currentUser.uid === targetSlug)) {
+        targetUid = currentUser.uid;
+        profileData = {
+          username: userUsername,
+          displayName: currentUser.displayName || userUsername,
+          photoURL: currentUser.photoURL || '',
+          email: currentUser.email || '',
+          uid: currentUser.uid,
+        };
+      }
+
+      setPublicProfileUser(profileData);
+
+      let fetchedItems: LinkItem[] = [];
+      if (targetUid) {
+        const publicLinksQuery = query(
+          collection(db, 'users', targetUid, 'links'),
+          where('isPublic', '==', true)
+        );
+        const linksSnap = await getDocs(publicLinksQuery);
+        const pubItems: LinkItem[] = [];
+        linksSnap.forEach((docSnap) => {
+          const d = docSnap.data();
+          pubItems.push({
+            id: docSnap.id,
+            title: d.title || '',
+            url: d.url || '',
+            category: d.category || 'Work',
+            description: d.description || '',
+            thumbnail: d.thumbnail || undefined,
+            createdAt: d.createdAt || new Date().toISOString(),
+            userId: targetUid,
+            isPublic: true,
+            isFavorite: Boolean(d.isFavorite),
+          });
+        });
+        pubItems.sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
+        fetchedItems = pubItems;
+        setPublicLinks(pubItems);
+      } else {
+        // Fallback for local demo links
+        if (targetSlug === userUsername || targetSlug === 'josephsoren') {
+          fetchedItems = links.filter((l) => l.isPublic);
+          setPublicLinks(fetchedItems);
+        } else {
+          setPublicLinks([]);
+        }
+      }
+
+      // Resolve category filter from initial category slug
+      if (initialCategorySlug) {
+        const pool = [
+          ...DEFAULT_CATEGORIES,
+          ...customCategories,
+          ...fetchedItems.map((item) => item.category),
+        ];
+        const resolved = resolveCategoryFromSlug(initialCategorySlug, pool);
+        setPublicCategory(resolved);
+      } else {
+        setPublicCategory('All');
+      }
+    } catch (err) {
+      console.error('Error loading public profile:', err);
+      if (targetSlug === userUsername || targetSlug === 'josephsoren') {
+        const fallback = links.filter((l) => l.isPublic);
+        setPublicLinks(fallback);
+        if (initialCategorySlug) {
+          const resolved = resolveCategoryFromSlug(initialCategorySlug, [
+            ...DEFAULT_CATEGORIES,
+            ...customCategories,
+            ...fallback.map((item) => item.category),
+          ]);
+          setPublicCategory(resolved);
+        } else {
+          setPublicCategory('All');
+        }
+      }
+    } finally {
+      setPublicProfileLoading(false);
+    }
+  };
+
+  // URL route listener on mount
+  useEffect(() => {
+    const route = getProfileRouteFromUrl();
+    if (route) {
+      loadPublicProfile(route.username, route.categorySlug);
+      setCurrentView('public_profile');
+    }
+  }, []);
+
+  // Popstate listener for browser back/forward
+  useEffect(() => {
+    const handlePopState = () => {
+      const route = getProfileRouteFromUrl();
+      if (route) {
+        loadPublicProfile(route.username, route.categorySlug);
+        setCurrentView('public_profile');
+      } else {
+        setCurrentView('dashboard');
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [userUsername, links, customCategories]);
+
+  // Handle public category selection with URL synchronization
+  const handleSelectPublicCategory = (cat: string) => {
+    setPublicCategory(cat);
+    const targetUser = publicProfileUsername || userUsername || 'josephsoren';
+    if (cat === 'All') {
+      window.history.pushState(null, '', `/${targetUser}`);
+    } else {
+      const slug = slugifyCategory(cat);
+      window.history.pushState(null, '', `/${targetUser}/${slug}`);
+    }
+  };
+
+  const handleBackToAllCategories = () => {
+    handleSelectPublicCategory('All');
+  };
+
+  // Click outside to close header dropdown menu
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('#headerThreeDotsBtn') && !target.closest('#headerDropdownMenu')) {
+        setIsHeaderMenuOpen(false);
+      }
+    };
+    if (isHeaderMenuOpen) {
+      document.addEventListener('click', handleClickOutside);
+    }
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, [isHeaderMenuOpen]);
+
+  const handleNavigateToPublicProfile = (slug?: string, category?: string) => {
+    const target = slug || userUsername || 'josephsoren';
+    if (category && category !== 'All') {
+      const catSlug = slugifyCategory(category);
+      window.history.pushState(null, '', `/${target}/${catSlug}`);
+      loadPublicProfile(target, catSlug);
+    } else {
+      window.history.pushState(null, '', `/${target}`);
+      loadPublicProfile(target);
+    }
+    setCurrentView('public_profile');
+  };
+
+  const handleBackToDashboard = () => {
+    window.history.pushState(null, '', '/');
+    setCurrentView('dashboard');
+  };
+
+  const handleCopyProfileUrl = (slug?: string) => {
+    const target = slug || userUsername || 'josephsoren';
+    const profileUrl = `${window.location.origin}/${target}`;
+    navigator.clipboard.writeText(profileUrl).then(() => {
+      setCopyNotification(`Public page link copied: ${profileUrl}`);
+      setTimeout(() => setCopyNotification(null), 2500);
+    });
+  };
+
+  const handleSaveUsername = async () => {
+    const clean = editUsernameInput.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
+    if (!clean) return;
+    setIsSavingUsername(true);
+    try {
+      if (currentUser) {
+        const existingDoc = await getDoc(doc(db, 'usernames', clean));
+        if (existingDoc.exists() && existingDoc.data().uid !== currentUser.uid) {
+          setCopyNotification('This username is already taken. Please choose another.');
+          setTimeout(() => setCopyNotification(null), 3000);
+          setIsSavingUsername(false);
+          return;
+        }
+
+        await setDoc(doc(db, 'usernames', clean), {
+          uid: currentUser.uid,
+          username: clean,
+          displayName: currentUser.displayName || clean,
+          photoURL: currentUser.photoURL || '',
+          email: currentUser.email || '',
+        });
+
+        await setDoc(
+          doc(db, 'users', currentUser.uid),
+          {
+            username: clean,
+          },
+          { merge: true }
+        );
+      }
+      setUserUsername(clean);
+      localStorage.setItem('lm_username', clean);
+      setCopyNotification(`Username updated to @${clean}!`);
+      setTimeout(() => setCopyNotification(null), 2500);
+    } catch (err) {
+      console.error('Error updating username:', err);
+      setCopyNotification('Failed to update username');
+      setTimeout(() => setCopyNotification(null), 2500);
+    } finally {
+      setIsSavingUsername(false);
+    }
+  };
 
   const saveLocalLinks = (newLinks: LinkItem[]) => {
     setLinks(newLinks);
@@ -256,7 +771,13 @@ export default function App() {
     setFormUrl('');
     setFormCategory('Work');
     setFormDescription('');
+    setFormThumbnail('');
+    setThumbnailError(null);
+    setShowCustomUrlInput(false);
     setFormIsPublic(false);
+    setFormIsFavorite(false);
+    setIsAddingCustomCategoryInModal(false);
+    setModalNewCategoryText('');
     setIsLinkModalOpen(true);
   };
 
@@ -266,8 +787,176 @@ export default function App() {
     setFormUrl(link.url);
     setFormCategory(link.category);
     setFormDescription(link.description || '');
+    setFormThumbnail(link.thumbnail || '');
+    setThumbnailError(null);
+    setShowCustomUrlInput(false);
     setFormIsPublic(Boolean(link.isPublic));
+    setFormIsFavorite(Boolean(link.isFavorite));
+    setIsAddingCustomCategoryInModal(false);
+    setModalNewCategoryText('');
     setIsLinkModalOpen(true);
+  };
+
+  // Generate preview thumbnail using Gemini AI
+  const handleGenerateThumbnail = async () => {
+    if (!formTitle.trim() && !formUrl.trim()) {
+      setThumbnailError('Please provide a title or URL before generating a thumbnail.');
+      return;
+    }
+
+    setIsGeneratingThumbnail(true);
+    setThumbnailError(null);
+
+    try {
+      const res = await fetch('/api/generate-thumbnail', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          title: formTitle.trim(),
+          description: formDescription.trim(),
+          url: formUrl.trim(),
+          category: formCategory,
+          style: thumbnailStyle,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.thumbnail) {
+        setFormThumbnail(data.thumbnail);
+        setThumbnailError(null);
+      } else {
+        setThumbnailError(data.error || 'Failed to generate thumbnail. Please try again.');
+      }
+    } catch (err: any) {
+      console.error('Error generating thumbnail:', err);
+      setThumbnailError(err?.message || 'Network error while generating thumbnail.');
+    } finally {
+      setIsGeneratingThumbnail(false);
+    }
+  };
+
+  // Toggle favorite / pin to top
+  const handleToggleFavorite = async (link: LinkItem) => {
+    const newFav = !link.isFavorite;
+    const updated = links.map((l) => (l.id === link.id ? { ...l, isFavorite: newFav } : l));
+    setLinks(updated);
+
+    if (currentUser) {
+      try {
+        const linkRef = doc(db, 'users', currentUser.uid, 'links', link.id);
+        await updateDoc(linkRef, {
+          isFavorite: newFav,
+        });
+      } catch (err) {
+        console.error('Error toggling favorite:', err);
+      }
+    } else {
+      saveLocalLinks(updated);
+    }
+    setCopyNotification(newFav ? 'Pinned to top as favorite!' : 'Removed from favorites');
+    setTimeout(() => setCopyNotification(null), 2000);
+  };
+
+  // Drag-and-drop handlers for links reordering
+  const handleDragStart = (e: React.DragEvent, id: string) => {
+    setDraggedLinkId(id);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', id);
+  };
+
+  const handleDragOver = (e: React.DragEvent, targetId: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (dragOverLinkId !== targetId) {
+      setDragOverLinkId(targetId);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent, targetId: string) => {
+    if (dragOverLinkId === targetId) {
+      setDragOverLinkId(null);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent, targetId: string) => {
+    e.preventDefault();
+    setDragOverLinkId(null);
+    const sourceId = draggedLinkId || e.dataTransfer.getData('text/plain');
+    setDraggedLinkId(null);
+
+    if (!sourceId || sourceId === targetId) return;
+
+    const sourceItem = links.find((l) => l.id === sourceId);
+    const targetItem = links.find((l) => l.id === targetId);
+    if (!sourceItem || !targetItem) return;
+
+    // We reorder within filteredLinks
+    const currentList = [...filteredLinks];
+    const sourceIdx = currentList.findIndex((l) => l.id === sourceId);
+    const targetIdx = currentList.findIndex((l) => l.id === targetId);
+
+    if (sourceIdx === -1 || targetIdx === -1) return;
+
+    // Moving between favorite status if dragged into a different zone
+    const targetIsFavorite = Boolean(targetItem.isFavorite);
+    const [moved] = currentList.splice(sourceIdx, 1);
+    const updatedMoved = { ...moved, isFavorite: targetIsFavorite };
+    currentList.splice(targetIdx, 0, updatedMoved);
+
+    // Reassign order numbers to the new sequence
+    const updatedIdsMap = new Map<string, { order: number; isFavorite: boolean }>();
+    currentList.forEach((item, idx) => {
+      updatedIdsMap.set(item.id, {
+        order: idx,
+        isFavorite: item.id === sourceId ? targetIsFavorite : Boolean(item.isFavorite),
+      });
+    });
+
+    // Update overall links array
+    const updatedAllLinks = links.map((link) => {
+      const updated = updatedIdsMap.get(link.id);
+      if (updated) {
+        return {
+          ...link,
+          order: updated.order,
+          isFavorite: updated.isFavorite,
+        };
+      }
+      return link;
+    });
+
+    // Optimistically update React state
+    setLinks(updatedAllLinks);
+
+    if (currentUser) {
+      try {
+        const batch = writeBatch(db);
+        updatedIdsMap.forEach((val, linkId) => {
+          const ref = doc(db, 'users', currentUser.uid, 'links', linkId);
+          batch.update(ref, {
+            order: val.order,
+            isFavorite: val.isFavorite,
+          });
+        });
+        await batch.commit();
+        setCopyNotification('Links reordered successfully');
+        setTimeout(() => setCopyNotification(null), 2000);
+      } catch (err) {
+        console.error('Error saving reordered links:', err);
+      }
+    } else {
+      saveLocalLinks(updatedAllLinks);
+      setCopyNotification('Links reordered successfully');
+      setTimeout(() => setCopyNotification(null), 2000);
+    }
+  };
+
+  const handleDragEnd = () => {
+    setDraggedLinkId(null);
+    setDragOverLinkId(null);
+    setDraggableCardId(null);
   };
 
   // Submit link
@@ -279,6 +968,12 @@ export default function App() {
       url = 'https://' + url;
     }
 
+    let finalCategory = formCategory;
+    if (isAddingCustomCategoryInModal && modalNewCategoryText.trim()) {
+      finalCategory = modalNewCategoryText.trim();
+      handleAddCategory(finalCategory);
+    }
+
     if (editingLink) {
       // Update
       if (currentUser) {
@@ -286,9 +981,11 @@ export default function App() {
         await updateDoc(linkRef, {
           title: formTitle.trim(),
           url: url,
-          category: formCategory,
+          category: finalCategory,
           description: formDescription.trim(),
+          thumbnail: formThumbnail.trim() || '',
           isPublic: formIsPublic,
+          isFavorite: formIsFavorite,
         });
       } else {
         const updated = links.map((l) =>
@@ -297,9 +994,11 @@ export default function App() {
                 ...l,
                 title: formTitle.trim(),
                 url: url,
-                category: formCategory,
+                category: finalCategory,
                 description: formDescription.trim(),
+                thumbnail: formThumbnail.trim() || undefined,
                 isPublic: formIsPublic,
+                isFavorite: formIsFavorite,
               }
             : l
         );
@@ -312,9 +1011,12 @@ export default function App() {
         await setDoc(newRef, {
           title: formTitle.trim(),
           url: url,
-          category: formCategory,
+          category: finalCategory,
           description: formDescription.trim(),
+          thumbnail: formThumbnail.trim() || '',
           isPublic: formIsPublic,
+          isFavorite: formIsFavorite,
+          order: 0,
           createdAt: new Date().toISOString(),
         });
       } else {
@@ -322,9 +1024,12 @@ export default function App() {
           id: Date.now().toString(),
           title: formTitle.trim(),
           url: url,
-          category: formCategory,
+          category: finalCategory,
           description: formDescription.trim(),
+          thumbnail: formThumbnail.trim() || undefined,
           isPublic: formIsPublic,
+          isFavorite: formIsFavorite,
+          order: 0,
           createdAt: new Date().toISOString(),
         };
         saveLocalLinks([newLink, ...links]);
@@ -436,6 +1141,7 @@ export default function App() {
           url: sharedItem.url,
           category: sharedItem.category,
           description: sharedItem.description || '',
+          thumbnail: sharedItem.thumbnail || '',
           isPublic: false,
           createdAt: new Date().toISOString(),
         });
@@ -452,6 +1158,7 @@ export default function App() {
         url: sharedItem.url,
         category: sharedItem.category,
         description: sharedItem.description || '',
+        thumbnail: sharedItem.thumbnail || undefined,
         isPublic: false,
         createdAt: new Date().toISOString(),
       };
@@ -712,11 +1419,15 @@ export default function App() {
     }
   };
 
-  // Filtered links
+  // Filtered links (Favorites pinned to top of grid, then by drag-and-drop order)
   const filteredLinks = useMemo(() => {
-    return links.filter((link) => {
+    const list = links.filter((link) => {
       const matchesCategory =
-        currentCategory === 'All' || link.category === currentCategory;
+        currentCategory === 'All'
+          ? true
+          : currentCategory === 'Favorites'
+          ? Boolean(link.isFavorite)
+          : link.category === currentCategory;
       const q = searchQuery.toLowerCase().trim();
       const matchesSearch =
         !q ||
@@ -725,25 +1436,100 @@ export default function App() {
         (link.description && link.description.toLowerCase().includes(q));
       return matchesCategory && matchesSearch;
     });
+
+    // Pinned Favorites ALWAYS sort to the top of the grid!
+    return list.sort((a, b) => {
+      const aFav = Boolean(a.isFavorite);
+      const bFav = Boolean(b.isFavorite);
+      if (aFav !== bFav) {
+        return aFav ? -1 : 1; // Pinned favorites first
+      }
+      if (typeof a.order === 'number' && typeof b.order === 'number') {
+        return a.order - b.order;
+      }
+      if (typeof a.order === 'number') return -1;
+      if (typeof b.order === 'number') return 1;
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+    });
   }, [links, currentCategory, searchQuery]);
 
   // Counts
   const counts = useMemo(() => {
     const map: Record<string, number> = {
       All: links.length,
-      Work: 0,
-      Social: 0,
-      Tools: 0,
-      Reading: 0,
-      Personal: 0,
+      Favorites: 0,
     };
+    allCategories.forEach((c) => {
+      map[c] = 0;
+    });
     links.forEach((l) => {
-      if (map[l.category] !== undefined) {
-        map[l.category]++;
+      if (l.isFavorite) {
+        map.Favorites = (map.Favorites || 0) + 1;
+      }
+      if (l.category) {
+        map[l.category] = (map[l.category] || 0) + 1;
       }
     });
     return map;
-  }, [links]);
+  }, [links, allCategories]);
+
+  // Settings view filtered links
+  const settingsFilteredLinks = useMemo(() => {
+    return links.filter((link) => {
+      if (settingsVisibilityFilter === 'public' && !link.isPublic) return false;
+      if (settingsVisibilityFilter === 'private' && link.isPublic) return false;
+      if (settingsCategoryFilter !== 'All' && link.category !== settingsCategoryFilter) return false;
+      if (settingsSearch) {
+        const q = settingsSearch.toLowerCase().trim();
+        const matchesTitle = link.title.toLowerCase().includes(q);
+        const matchesUrl = link.url.toLowerCase().includes(q);
+        const matchesDesc = (link.description || '').toLowerCase().includes(q);
+        return matchesTitle || matchesUrl || matchesDesc;
+      }
+      return true;
+    });
+  }, [links, settingsVisibilityFilter, settingsCategoryFilter, settingsSearch]);
+
+  // Public profile filtered links
+  const publicFilteredLinks = useMemo(() => {
+    return publicLinks.filter((link) => {
+      if (publicCategory !== 'All') {
+        if (publicCategory === 'Favourites' || publicCategory === 'Favorites') {
+          if (!link.isFavorite) return false;
+        } else {
+          const catMatches =
+            link.category.toLowerCase() === publicCategory.toLowerCase() ||
+            slugifyCategory(link.category) === slugifyCategory(publicCategory) ||
+            link.category.toLowerCase().replace(/[-_]/g, ' ') === publicCategory.toLowerCase().replace(/[-_]/g, ' ');
+          if (!catMatches) return false;
+        }
+      }
+      if (publicSearch) {
+        const q = publicSearch.toLowerCase().trim();
+        const matchesTitle = link.title.toLowerCase().includes(q);
+        const matchesUrl = link.url.toLowerCase().includes(q);
+        const matchesDesc = (link.description || '').toLowerCase().includes(q);
+        return matchesTitle || matchesUrl || matchesDesc;
+      }
+      return true;
+    });
+  }, [publicLinks, publicCategory, publicSearch]);
+
+  // Derived available public categories & favorites presence
+  const availablePublicCategories = useMemo(() => {
+    const set = new Set<string>();
+    publicLinks.forEach((l) => {
+      if (l.category && l.category !== 'All' && l.category !== 'Favorites' && l.category !== 'Favourites') {
+        set.add(l.category);
+      }
+    });
+    const list = Array.from(set);
+    return list.length > 0 ? list : DEFAULT_CATEGORIES;
+  }, [publicLinks]);
+
+  const hasPublicFavorites = useMemo(() => {
+    return publicLinks.some((l) => l.isFavorite);
+  }, [publicLinks]);
 
   return (
     <>
@@ -772,311 +1558,1517 @@ export default function App() {
         </div>
       )}
 
-      {/* Navigation / Header */}
-      <header className="navbar" id="navbar">
-        <div className="logo" id="appLogo">
-          <i className="fa-solid fa-link logo-icon"></i>
-          <span>
-            LinkManager<span className="domain">.in</span>
-          </span>
-        </div>
-
-        <div className="nav-controls">
-          <div className="search-box">
-            <i className="fa-solid fa-magnifying-glass"></i>
-            <input
-              type="text"
-              id="searchInput"
-              placeholder="Search links or tags..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
+      {/* Navigation / Header (visible on Dashboard and Settings) */}
+      {currentView !== 'public_profile' && (
+        <header className="navbar" id="navbar">
+          <div
+            className="logo"
+            id="appLogo"
+            onClick={handleBackToDashboard}
+            style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            title="Return to Dashboard"
+          >
+            <i className="fa-solid fa-link logo-icon"></i>
+            <span>
+              LinkManager<span className="domain">.in</span>
+            </span>
+            {currentView === 'settings' && (
+              <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', fontWeight: 600, marginLeft: '4px' }}>
+                / Settings
+              </span>
+            )}
           </div>
 
-          <button
-            id="themeToggleBtn"
-            className="icon-btn"
-            title="Toggle Dark/Light Mode"
-            onClick={toggleTheme}
-          >
-            <i className={isDarkMode ? 'fa-solid fa-sun' : 'fa-solid fa-moon'}></i>
-          </button>
-
-          {/* Firebase Authentication Button / Profile */}
-          {currentUser ? (
-            <div className="user-profile-badge" id="userProfileBadge">
-              {currentUser.photoURL ? (
-                <img
-                  src={currentUser.photoURL}
-                  alt="avatar"
-                  className="user-avatar"
-                />
-              ) : (
-                <div className="user-avatar">
-                  {(currentUser.displayName || currentUser.email || 'U')[0].toUpperCase()}
+          <div className="nav-controls">
+            {/* Desktop Controls: Search, Theme, Settings, Public Profile, User Badge */}
+            <div className="nav-desktop-controls">
+              {currentView === 'dashboard' && (
+                <div className="search-box nav-search-desktop">
+                  <i className="fa-solid fa-magnifying-glass"></i>
+                  <input
+                    type="text"
+                    id="searchInput"
+                    placeholder="Search links or tags..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      className="search-clear-btn"
+                      onClick={() => setSearchQuery('')}
+                      title="Clear search"
+                    >
+                      <i className="fa-solid fa-xmark"></i>
+                    </button>
+                  )}
                 </div>
               )}
-              <span style={{ maxWidth: '110px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {currentUser.displayName || currentUser.email?.split('@')[0]}
-              </span>
+
               <button
-                id="signOutBtn"
-                onClick={handleSignOut}
-                title="Sign out"
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  padding: '2px 4px',
-                  display: 'flex',
-                  alignItems: 'center',
-                }}
+                id="themeToggleBtn"
+                className="icon-btn"
+                title="Toggle Dark/Light Mode"
+                onClick={toggleTheme}
               >
-                <i className="fa-solid fa-arrow-right-from-bracket"></i>
+                <i className={isDarkMode ? 'fa-solid fa-sun' : 'fa-solid fa-moon'}></i>
+              </button>
+
+              {/* Quick Link Settings Button */}
+              <button
+                id="navLinkSettingsBtn"
+                className="icon-btn"
+                title="Link Settings"
+                onClick={() => setCurrentView(currentView === 'settings' ? 'dashboard' : 'settings')}
+                style={{ color: currentView === 'settings' ? 'var(--primary-color)' : undefined }}
+              >
+                <i className="fa-solid fa-sliders"></i>
+              </button>
+
+              {/* Quick Public Page View Button */}
+              <button
+                id="navViewPublicBtn"
+                className="icon-btn"
+                title={`View your public page (/${userUsername})`}
+                onClick={() => handleNavigateToPublicProfile()}
+              >
+                <i className="fa-solid fa-globe"></i>
+              </button>
+
+              {/* Firebase Authentication Button / Profile */}
+              {currentUser ? (
+                <div className="user-profile-badge" id="userProfileBadge">
+                  {currentUser.photoURL ? (
+                    <img
+                      src={currentUser.photoURL}
+                      alt="avatar"
+                      className="user-avatar"
+                    />
+                  ) : (
+                    <div className="user-avatar">
+                      {(currentUser.displayName || currentUser.email || 'U')[0].toUpperCase()}
+                    </div>
+                  )}
+                  <span style={{ maxWidth: '110px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {currentUser.displayName || currentUser.email?.split('@')[0]}
+                  </span>
+                  <button
+                    id="signOutBtn"
+                    onClick={handleSignOut}
+                    title="Sign out"
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      color: 'var(--text-secondary)',
+                      cursor: 'pointer',
+                      padding: '2px 4px',
+                      display: 'flex',
+                      alignItems: 'center',
+                    }}
+                  >
+                    <i className="fa-solid fa-arrow-right-from-bracket"></i>
+                  </button>
+                </div>
+              ) : (
+                <button
+                  id="authOpenBtn"
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    setIsLoginMode(true);
+                    setAuthError(null);
+                    setIsAuthModalOpen(true);
+                  }}
+                  title="Sign in with Firebase to sync your links"
+                >
+                  <i className="fa-solid fa-user"></i> Sign In
+                </button>
+              )}
+            </div>
+
+            {/* Top Right Add Link Button - Always in Navbar */}
+            <button id="addLinkBtn" className="btn btn-primary" onClick={handleOpenAddModal}>
+              <i className="fa-solid fa-plus"></i> Add Link
+            </button>
+          </div>
+        </header>
+      )}
+
+      {/* Mobile Sub-Header: Placed immediately after header in mobile screen sizes */}
+      {currentView !== 'public_profile' && (
+        <div className="mobile-header-subbar" id="mobileHeaderSubbar">
+          <div className="mobile-subbar-controls">
+            <button
+              id="mobileThemeToggleBtn"
+              className="icon-btn"
+              title="Toggle Dark/Light Mode"
+              onClick={toggleTheme}
+            >
+              <i className={isDarkMode ? 'fa-solid fa-sun' : 'fa-solid fa-moon'}></i>
+            </button>
+
+            <button
+              id="mobileNavLinkSettingsBtn"
+              className="icon-btn"
+              title="Link Settings"
+              onClick={() => setCurrentView(currentView === 'settings' ? 'dashboard' : 'settings')}
+              style={{ color: currentView === 'settings' ? 'var(--primary-color)' : undefined }}
+            >
+              <i className="fa-solid fa-sliders"></i>
+            </button>
+
+            <button
+              id="mobileNavViewPublicBtn"
+              className="icon-btn"
+              title={`View your public page (/${userUsername})`}
+              onClick={() => handleNavigateToPublicProfile()}
+            >
+              <i className="fa-solid fa-globe"></i>
+            </button>
+
+            {currentUser ? (
+              <div className="user-profile-badge" id="mobileUserProfileBadge">
+                {currentUser.photoURL ? (
+                  <img
+                    src={currentUser.photoURL}
+                    alt="avatar"
+                    className="user-avatar"
+                  />
+                ) : (
+                  <div className="user-avatar">
+                    {(currentUser.displayName || currentUser.email || 'U')[0].toUpperCase()}
+                  </div>
+                )}
+                <button
+                  id="mobileSignOutBtn"
+                  onClick={handleSignOut}
+                  title="Sign out"
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    padding: '2px 4px',
+                    display: 'flex',
+                    alignItems: 'center',
+                  }}
+                >
+                  <i className="fa-solid fa-arrow-right-from-bracket"></i>
+                </button>
+              </div>
+            ) : (
+              <button
+                id="mobileAuthOpenBtn"
+                className="btn btn-secondary"
+                style={{ padding: '4px 10px', fontSize: '0.8rem' }}
+                onClick={() => {
+                  setIsLoginMode(true);
+                  setAuthError(null);
+                  setIsAuthModalOpen(true);
+                }}
+                title="Sign in with Firebase to sync your links"
+              >
+                <i className="fa-solid fa-user"></i> Sign In
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* VIEW 1: Dashboard Main Container */}
+      {currentView === 'dashboard' && (
+        <div className="app-container" id="appContainer">
+          {/* Sidebar: Categories */}
+          <aside className="sidebar" id="sidebar">
+            <div className="sidebar-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <h3>Categories</h3>
+              <button
+                id="toggleAddCategoryBtn"
+                className="btn-icon-subtle"
+                title="Add New Category"
+                style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '0.85rem', padding: '4px 6px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                onClick={() => setShowAddCategorySidebar(!showAddCategorySidebar)}
+              >
+                <i className={`fa-solid ${showAddCategorySidebar ? 'fa-minus' : 'fa-plus'}`}></i>
+                <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>New</span>
               </button>
             </div>
-          ) : (
-            <button
-              id="authOpenBtn"
-              className="btn btn-secondary"
-              onClick={() => {
-                setIsLoginMode(true);
-                setAuthError(null);
-                setIsAuthModalOpen(true);
-              }}
-              title="Sign in with Firebase to sync your links"
-            >
-              <i className="fa-solid fa-user"></i> Sign In
-            </button>
-          )}
 
-          <button id="addLinkBtn" className="btn btn-primary" onClick={handleOpenAddModal}>
-            <i className="fa-solid fa-plus"></i> Add Link
-          </button>
-        </div>
-      </header>
+            {showAddCategorySidebar && (
+              <div className="sidebar-category-add-container">
+                <form
+                  className="sidebar-category-add-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (sidebarCategoryInput.trim()) {
+                      const newCat = sidebarCategoryInput.trim();
+                      handleAddCategory(newCat);
+                      setCurrentCategory(newCat);
+                      setSidebarCategoryInput('');
+                      setShowAddCategorySidebar(false);
+                    }
+                  }}
+                >
+                  <input
+                    type="text"
+                    id="sidebarCategoryInput"
+                    className="sidebar-category-input"
+                    placeholder="e.g. Exam Links"
+                    value={sidebarCategoryInput}
+                    onChange={(e) => setSidebarCategoryInput(e.target.value)}
+                    autoFocus
+                  />
+                  <button
+                    type="submit"
+                    id="sidebarSubmitCategoryBtn"
+                    className="btn btn-primary sidebar-category-add-btn"
+                  >
+                    Add
+                  </button>
+                  <button
+                    type="button"
+                    id="sidebarCancelCategoryBtn"
+                    className="sidebar-category-cancel-btn"
+                    onClick={() => {
+                      setShowAddCategorySidebar(false);
+                      setSidebarCategoryInput('');
+                    }}
+                    title="Cancel"
+                  >
+                    <i className="fa-solid fa-xmark"></i>
+                  </button>
+                </form>
+              </div>
+            )}
 
-      {/* Main Container */}
-      <div className="app-container" id="appContainer">
-        {/* Sidebar: Categories */}
-        <aside className="sidebar" id="sidebar">
-          <div className="sidebar-header">
-            <h3>Categories</h3>
-          </div>
-          <ul className="category-list" id="categoryList">
-            <li
-              className={currentCategory === 'All' ? 'active' : ''}
-              data-category="All"
-              id="catAll"
-              onClick={() => setCurrentCategory('All')}
-            >
-              <i className="fa-solid fa-border-all"></i> All Links{' '}
-              <span className="count-badge" id="countAll">
-                {counts.All}
-              </span>
-            </li>
-            <li
-              className={currentCategory === 'Work' ? 'active' : ''}
-              data-category="Work"
-              id="catWork"
-              onClick={() => setCurrentCategory('Work')}
-            >
-              <i className="fa-solid fa-briefcase"></i> Work{' '}
-              <span className="count-badge" id="countWork">
-                {counts.Work}
-              </span>
-            </li>
-            <li
-              className={currentCategory === 'Social' ? 'active' : ''}
-              data-category="Social"
-              id="catSocial"
-              onClick={() => setCurrentCategory('Social')}
-            >
-              <i className="fa-solid fa-hashtag"></i> Social{' '}
-              <span className="count-badge" id="countSocial">
-                {counts.Social}
-              </span>
-            </li>
-            <li
-              className={currentCategory === 'Tools' ? 'active' : ''}
-              data-category="Tools"
-              id="catTools"
-              onClick={() => setCurrentCategory('Tools')}
-            >
-              <i className="fa-solid fa-wrench"></i> Tools{' '}
-              <span className="count-badge" id="countTools">
-                {counts.Tools}
-              </span>
-            </li>
-            <li
-              className={currentCategory === 'Reading' ? 'active' : ''}
-              data-category="Reading"
-              id="catReading"
-              onClick={() => setCurrentCategory('Reading')}
-            >
-              <i className="fa-solid fa-book-bookmark"></i> Reading{' '}
-              <span className="count-badge" id="countReading">
-                {counts.Reading}
-              </span>
-            </li>
-            <li
-              className={currentCategory === 'Personal' ? 'active' : ''}
-              data-category="Personal"
-              id="catPersonal"
-              onClick={() => setCurrentCategory('Personal')}
-            >
-              <i className="fa-solid fa-user"></i> Personal{' '}
-              <span className="count-badge" id="countPersonal">
-                {counts.Personal}
-              </span>
-            </li>
-          </ul>
-
-          <div className="sidebar-footer" id="sidebarFooter">
-            <button id="exportPdfBtn" className="btn btn-outline-sm" onClick={handleExportPDF} title="Export bookmarks as a PDF document">
-              <i className="fa-solid fa-file-pdf" style={{ color: '#ef4444' }}></i> Export PDF
-            </button>
-            <button id="exportDataBtn" className="btn btn-outline-sm" onClick={handleExportJSON} title="Export bookmarks as a JSON backup">
-              <i className="fa-solid fa-file-code"></i> Export JSON
-            </button>
-          </div>
-        </aside>
-
-        {/* Main Content Grid */}
-        <main className="main-content" id="mainContent">
-          <div className="content-header" id="contentHeader" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
-            <div>
-              <h2 id="currentCategoryTitle">
-                {currentCategory === 'All' ? 'All Links' : `${currentCategory} Links`}
-              </h2>
-              <span id="totalLinksSubtitle" className="subtitle">
-                {filteredLinks.length} items saved
-              </span>
-            </div>
-            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-              <button
-                id="headerExportPdfBtn"
-                className="btn btn-secondary"
-                style={{ fontSize: '0.82rem', padding: '6px 12px' }}
-                onClick={handleExportPDF}
-                title="Export current view as PDF"
+            <ul className="category-list" id="categoryList">
+              <li
+                className={currentCategory === 'All' ? 'active' : ''}
+                data-category="All"
+                id="catAll"
+                onClick={() => setCurrentCategory('All')}
               >
+                <i className="fa-solid fa-border-all"></i> All Links{' '}
+                <span className="count-badge" id="countAll">
+                  {counts.All}
+                </span>
+              </li>
+              <li
+                className={currentCategory === 'Favorites' ? 'active' : ''}
+                data-category="Favorites"
+                id="catFavorites"
+                onClick={() => setCurrentCategory('Favorites')}
+              >
+                <i className="fa-solid fa-star" style={{ color: '#f59e0b' }}></i> Favorites{' '}
+                <span className="count-badge" id="countFavorites">
+                  {counts.Favorites}
+                </span>
+              </li>
+
+              {allCategories.map((cat) => {
+                let iconClass = 'fa-solid fa-folder';
+                if (cat === 'Work') iconClass = 'fa-solid fa-briefcase';
+                else if (cat === 'Social') iconClass = 'fa-solid fa-hashtag';
+                else if (cat === 'Tools') iconClass = 'fa-solid fa-wrench';
+                else if (cat === 'Reading') iconClass = 'fa-solid fa-book-bookmark';
+                else if (cat === 'Personal') iconClass = 'fa-solid fa-user';
+                else if (cat.toLowerCase().includes('exam') || cat.toLowerCase().includes('study')) iconClass = 'fa-solid fa-graduation-cap';
+                else if (cat.toLowerCase().includes('code') || cat.toLowerCase().includes('dev')) iconClass = 'fa-solid fa-code';
+                else if (cat.toLowerCase().includes('video') || cat.toLowerCase().includes('media')) iconClass = 'fa-solid fa-play';
+
+                return (
+                  <li
+                    key={cat}
+                    className={currentCategory === cat ? 'active' : ''}
+                    data-category={cat}
+                    id={`cat-${slugifyCategory(cat)}`}
+                    onClick={() => setCurrentCategory(cat)}
+                  >
+                    <i className={iconClass}></i> {cat}{' '}
+                    <span className="count-badge" id={`count-${slugifyCategory(cat)}`}>
+                      {counts[cat] || 0}
+                    </span>
+                  </li>
+                );
+              })}
+
+              {/* Quick Add Category Pill for Mobile Ribbon */}
+              <li
+                className="category-ribbon-new-item"
+                id="catRibbonNewBtn"
+                onClick={() => setShowAddCategorySidebar(!showAddCategorySidebar)}
+                title="Add New Category"
+              >
+                <i className={`fa-solid ${showAddCategorySidebar ? 'fa-xmark' : 'fa-plus'}`}></i>
+                <span>{showAddCategorySidebar ? 'Close' : 'New'}</span>
+              </li>
+            </ul>
+
+            <div className="sidebar-footer" id="sidebarFooter">
+              <button id="exportPdfBtn" className="btn btn-outline-sm" onClick={handleExportPDF} title="Export bookmarks as a PDF document">
                 <i className="fa-solid fa-file-pdf" style={{ color: '#ef4444' }}></i> Export PDF
               </button>
+              <button id="exportDataBtn" className="btn btn-outline-sm" onClick={handleExportJSON} title="Export bookmarks as a JSON backup">
+                <i className="fa-solid fa-file-code"></i> Export JSON
+              </button>
             </div>
-          </div>
+          </aside>
 
-          {/* Link Cards Grid Container */}
-          <div className="links-grid" id="linksGrid">
-            {filteredLinks.map((link) => {
-              const domain = getDomain(link.url);
-              const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+          {/* Main Content Grid */}
+          <main className="main-content" id="mainContent">
+            <div className="content-header" id="contentHeader" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
+              <div>
+                <h2 id="currentCategoryTitle">
+                  {currentCategory === 'All' ? 'All Links' : `${currentCategory} Links`}
+                </h2>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '4px' }}>
+                  <span id="totalLinksSubtitle" className="subtitle">
+                    {filteredLinks.length} items saved
+                  </span>
+                  {counts.Favorites > 0 && (
+                    <span className="badge badge-favorite" id="pinnedCounterBadge" style={{ fontSize: '0.72rem' }}>
+                      <i className="fa-solid fa-thumbtack"></i> {counts.Favorites} Pinned to Top
+                    </span>
+                  )}
+                  <span
+                    id="dragReorderNotice"
+                    style={{
+                      fontSize: '0.74rem',
+                      color: 'var(--text-secondary)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      background: 'var(--bg-color)',
+                      padding: '2px 8px',
+                      borderRadius: '4px',
+                      border: '1px solid var(--border-color)',
+                    }}
+                    title="Drag and drop cards using the grip icon to reorder links"
+                  >
+                    <i className="fa-solid fa-grip-vertical"></i> Drag to reorder
+                  </span>
+                </div>
+              </div>
+              <div className="header-actions-row" style={{ display: 'flex', gap: '8px', alignItems: 'center', position: 'relative' }}>
+                <button
+                  id="shareCurrentCategoryBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                  onClick={() => handleCopyCategoryShareUrl(currentCategory)}
+                  title={`Copy share link for ${currentCategory === 'All' ? 'all public links' : currentCategory + ' category'}`}
+                >
+                  <i className="fa-solid fa-share-nodes" style={{ color: 'var(--primary-color)' }}></i> Share {currentCategory === 'All' ? 'All' : currentCategory}
+                </button>
+                <button
+                  id="headerCategoryQrBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                  onClick={() =>
+                    handleOpenQrModal(
+                      getCategoryShareUrl(currentCategory),
+                      currentCategory === 'All' ? `@${userUsername || 'josephsoren'}'s Public Links` : `${currentCategory} Links`,
+                      `Scan to open ${currentCategory === 'All' ? 'all bookmarks' : currentCategory + ' category'} on your mobile phone`,
+                      currentCategory !== 'All' ? currentCategory : undefined
+                    )
+                  }
+                  title={`Show QR Code for ${currentCategory === 'All' ? 'all public links' : currentCategory + ' category'}`}
+                >
+                  <i className="fa-solid fa-qrcode" style={{ color: 'var(--primary-color)' }}></i> QR Code
+                </button>
+                <button
+                  id="headerExportPdfBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                  onClick={handleExportPDF}
+                  title="Export current view as PDF"
+                >
+                  <i className="fa-solid fa-file-pdf" style={{ color: '#ef4444' }}></i> Export PDF
+                </button>
 
-              return (
-                <div className="card" key={link.id} id={`card-${link.id}`}>
-                  <div>
-                    <div className="card-header">
-                      <img
-                        src={faviconUrl}
-                        className="favicon"
-                        alt="Icon"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).src =
-                            'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                {/* Three Vertical Dots Button beside Export PDF */}
+                <div style={{ position: 'relative' }}>
+                  <button
+                    id="headerThreeDotsBtn"
+                    className="btn btn-secondary"
+                    style={{ fontSize: '0.9rem', padding: '6px 11px', cursor: 'pointer' }}
+                    onClick={() => setIsHeaderMenuOpen(!isHeaderMenuOpen)}
+                    title="Link Settings & Public Page Options"
+                  >
+                    <i className="fa-solid fa-ellipsis-vertical"></i>
+                  </button>
+
+                  {/* Three Dots Dropdown Menu */}
+                  {isHeaderMenuOpen && (
+                    <div className="dropdown-menu" id="headerDropdownMenu">
+                      <button
+                        className="dropdown-item"
+                        id="menuLinkSettingsBtn"
+                        onClick={() => {
+                          setIsHeaderMenuOpen(false);
+                          setCurrentView('settings');
                         }}
-                      />
-                      <div className="card-title-area">
-                        <h4>{link.title}</h4>
-                        <span className="domain-tag">{domain}</span>
+                      >
+                        <i className="fa-solid fa-sliders" style={{ color: 'var(--primary-color)' }}></i> Link Settings
+                      </button>
+                      <button
+                        className="dropdown-item"
+                        id="menuViewPublicPageBtn"
+                        onClick={() => {
+                          setIsHeaderMenuOpen(false);
+                          handleNavigateToPublicProfile();
+                        }}
+                      >
+                        <i className="fa-solid fa-globe" style={{ color: 'var(--accent-green)' }}></i> View Public Page
+                      </button>
+                      <button
+                        className="dropdown-item"
+                        id="menuCopyPublicUrlBtn"
+                        onClick={() => {
+                          setIsHeaderMenuOpen(false);
+                          handleCopyProfileUrl();
+                        }}
+                      >
+                        <i className="fa-regular fa-copy"></i> Copy Public Page Link
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Mobile Search Area: Positioned immediately after this action bar on mobile devices */}
+              <div className="mobile-search-area" id="mobileSearchArea">
+                <div className="search-box mobile-search-box">
+                  <i className="fa-solid fa-magnifying-glass"></i>
+                  <input
+                    type="text"
+                    id="mobileSearchInput"
+                    placeholder="Search links or tags..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      id="clearMobileSearchBtn"
+                      className="search-clear-btn"
+                      onClick={() => setSearchQuery('')}
+                      title="Clear search"
+                    >
+                      <i className="fa-solid fa-xmark"></i>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Link Cards Grid Container (Drag and Drop Reordering, Favorite Pinned, Only Copy & Open Link icon) */}
+            <div className="links-grid" id="linksGrid">
+              {filteredLinks.map((link) => {
+                const domain = getDomain(link.url);
+                const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+                return (
+                  <div
+                    className={`card ${link.isFavorite ? 'is-favorite' : ''} ${draggedLinkId === link.id ? 'is-dragging' : ''} ${dragOverLinkId === link.id ? 'drag-over' : ''}`}
+                    key={link.id}
+                    id={`card-${link.id}`}
+                    draggable={draggableCardId === link.id}
+                    onDragStart={(e) => handleDragStart(e, link.id)}
+                    onDragOver={(e) => handleDragOver(e, link.id)}
+                    onDragLeave={(e) => handleDragLeave(e, link.id)}
+                    onDrop={(e) => handleDrop(e, link.id)}
+                    onDragEnd={handleDragEnd}
+                  >
+                    {/* Card Top Control Bar: Drag Handle & Favorite Pin Star */}
+                    <div className="card-top-controls" id={`cardTopControls-${link.id}`}>
+                      <div
+                        className="card-drag-handle"
+                        id={`dragHandle-${link.id}`}
+                        title="Drag to reorder card"
+                        onMouseEnter={() => setDraggableCardId(link.id)}
+                        onMouseLeave={() => {
+                          if (!draggedLinkId) setDraggableCardId(null);
+                        }}
+                      >
+                        <i className="fa-solid fa-grip-vertical"></i>
+                      </div>
+                      <button
+                        type="button"
+                        className={`favorite-star-btn ${link.isFavorite ? 'is-active' : ''}`}
+                        id={`favBtn-${link.id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleFavorite(link);
+                        }}
+                        title={link.isFavorite ? 'Pinned Favorite (Click to unpin)' : 'Pin to top as favorite'}
+                        aria-label="Toggle Favorite"
+                      >
+                        <i className={link.isFavorite ? 'fa-solid fa-star' : 'fa-regular fa-star'}></i>
+                      </button>
+                    </div>
+
+                    <div>
+                      <div className="card-header">
+                        <img
+                          src={faviconUrl}
+                          className="favicon"
+                          alt="Icon"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src =
+                              'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                          }}
+                        />
+                        <div className="card-title-area">
+                          <a
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="card-title-link"
+                            id={`cardTitleLink-${link.id}`}
+                            title={`Open ${link.title}`}
+                          >
+                            <h4>{link.title}</h4>
+                          </a>
+                          <span className="domain-tag">{domain}</span>
+                        </div>
+                      </div>
+                      <p className="card-description">
+                        {link.description || 'No description added.'}
+                      </p>
+                    </div>
+                    <div className="card-footer">
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <span className="badge">{link.category}</span>
+                        {link.isPublic && (
+                          <span
+                            className="badge"
+                            style={{
+                              backgroundColor: 'rgba(16, 185, 129, 0.12)',
+                              color: '#10b981',
+                              borderColor: 'rgba(16, 185, 129, 0.3)',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              fontSize: '0.72rem',
+                            }}
+                            title="This link is public and visible on your public page"
+                          >
+                            <i className="fa-solid fa-globe" style={{ fontSize: '0.65rem' }}></i> Public
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Card actions: ONLY Copy and Open Link Icon as requested */}
+                      <div className="card-actions">
+                        <button
+                          id={`copyBtn-${link.id}`}
+                          onClick={() => copyToClipboard(link.url)}
+                          title="Copy URL"
+                        >
+                          <i className="fa-regular fa-copy"></i>
+                        </button>
+                        <a
+                          id={`openBtn-${link.id}`}
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open Link in New Tab"
+                        >
+                          <i className="fa-solid fa-arrow-up-right-from-square"></i>
+                        </a>
                       </div>
                     </div>
-                    <p className="card-description">
-                      {link.description || 'No description added.'}
-                    </p>
                   </div>
-                  <div className="card-footer">
-                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                      <span className="badge">{link.category}</span>
-                      {link.isPublic && (
-                        <span
-                          className="badge"
-                          style={{
-                            backgroundColor: 'rgba(16, 185, 129, 0.12)',
-                            color: '#10b981',
-                            borderColor: 'rgba(16, 185, 129, 0.3)',
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                            cursor: 'pointer',
-                            fontSize: '0.72rem',
-                          }}
-                          onClick={() => handleOpenShareModal(link)}
-                          title="This bookmark is shared publicly. Click to manage sharing."
-                        >
-                          <i className="fa-solid fa-globe" style={{ fontSize: '0.65rem' }}></i> Public
-                        </span>
-                      )}
-                    </div>
-                    <div className="card-actions">
-                      <button
-                        id={`copyBtn-${link.id}`}
-                        onClick={() => copyToClipboard(link.url)}
-                        title="Copy URL"
-                      >
-                        <i className="fa-regular fa-copy"></i>
-                      </button>
-                      <button
-                        id={`shareBtn-${link.id}`}
-                        onClick={() => handleOpenShareModal(link)}
-                        title="Share link to public"
-                        style={{ color: link.isPublic ? 'var(--accent-green)' : undefined }}
-                      >
-                        <i className="fa-solid fa-share-nodes"></i>
-                      </button>
-                      <a
-                        id={`openBtn-${link.id}`}
-                        href={link.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        title="Open Link in New Tab"
-                      >
-                        <i className="fa-solid fa-arrow-up-right-from-square"></i>
-                      </a>
-                      <button
-                        id={`editBtn-${link.id}`}
-                        onClick={() => handleOpenEditModal(link)}
-                        title="Edit Link"
-                      >
-                        <i className="fa-regular fa-pen-to-square"></i>
-                      </button>
-                      <button
-                        id={`deleteBtn-${link.id}`}
-                        className="delete-btn"
-                        onClick={() => handleOpenDeleteModal(link)}
-                        title="Delete Link"
-                      >
-                        <i className="fa-regular fa-trash-can"></i>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+
+            {/* Empty State View */}
+            {filteredLinks.length === 0 && (
+              <div className="empty-state" id="emptyState">
+                <i className="fa-solid fa-link-slash"></i>
+                <h3>No links found</h3>
+                <p>
+                  Click &quot;Add Link&quot; to save your first bookmark or clear your search query.
+                </p>
+              </div>
+            )}
+          </main>
+        </div>
+      )}
+
+      {/* VIEW 2: Link Settings & Privacy Management Page */}
+      {currentView === 'settings' && (
+        <div className="settings-container" id="settingsContainer">
+          {/* Top Bar with Back Button */}
+          <div className="settings-top-bar">
+            <button
+              id="backToDashboardBtn"
+              className="btn btn-secondary"
+              onClick={handleBackToDashboard}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+            >
+              <i className="fa-solid fa-arrow-left"></i> Back to Dashboard
+            </button>
+            <div>
+              <h2 style={{ fontSize: '1.35rem', margin: 0, fontWeight: 700 }}>Link Settings & Management</h2>
+              <span className="subtitle">
+                Configure your public handle, toggle public/private visibility, and edit bookmark details
+              </span>
+            </div>
           </div>
 
-          {/* Empty State View */}
-          {filteredLinks.length === 0 && (
-            <div className="empty-state" id="emptyState">
-              <i className="fa-solid fa-link-slash"></i>
-              <h3>No links found</h3>
-              <p>
-                Click &quot;Add Link&quot; to save your first bookmark or clear your search query.
-              </p>
+          {/* Personal Public Page & Subfolder Setup */}
+          <div className="settings-profile-card" id="profileSettingsCard">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+                  <i className="fa-solid fa-globe" style={{ color: 'var(--primary-color)', fontSize: '1.2rem' }}></i>
+                  <h3 style={{ fontSize: '1.1rem', margin: 0, fontWeight: 600 }}>Your Public Page & Subfolder</h3>
+                </div>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.88rem', margin: 0, maxWidth: '600px' }}>
+                  When you share your subfolder link, visitors can browse all bookmarks you’ve marked as <strong>Public</strong>.
+                </p>
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  id="copySettingsPublicUrlBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.85rem' }}
+                  onClick={() => handleCopyProfileUrl()}
+                >
+                  <i className="fa-regular fa-copy"></i> Copy Public URL
+                </button>
+                <button
+                  id="viewSettingsPublicPageBtn"
+                  className="btn btn-primary"
+                  style={{ fontSize: '0.85rem' }}
+                  onClick={() => handleNavigateToPublicProfile()}
+                >
+                  <i className="fa-solid fa-arrow-up-right-from-square"></i> View Public Page
+                </button>
+              </div>
+            </div>
+
+            {/* Subfolder Handle Configuration */}
+            <div className="profile-url-box" style={{ marginTop: '16px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', flex: 1 }}>
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', fontWeight: 600, textTransform: 'uppercase' }}>
+                  Public Subfolder Link
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                  <span style={{ color: 'var(--primary-color)', fontWeight: 600, fontSize: '0.95rem' }}>
+                    https://linkmanager.in/
+                  </span>
+                  <input
+                    type="text"
+                    id="editUsernameInput"
+                    className="form-control"
+                    style={{ width: '170px', padding: '6px 10px', fontSize: '0.9rem', fontWeight: 600 }}
+                    value={editUsernameInput}
+                    onChange={(e) => setEditUsernameInput(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+                    placeholder="username"
+                  />
+                  <button
+                    id="saveUsernameBtn"
+                    className="btn btn-primary"
+                    style={{ padding: '6px 14px', fontSize: '0.85rem' }}
+                    onClick={handleSaveUsername}
+                    disabled={isSavingUsername || editUsernameInput === userUsername}
+                  >
+                    {isSavingUsername ? 'Saving...' : 'Save Handle'}
+                  </button>
+                  <button
+                    id="subfolderQrBtn"
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: '6px 12px', fontSize: '0.85rem' }}
+                    onClick={() =>
+                      handleOpenQrModal(
+                        getProfileShareUrl(userUsername),
+                        `@${userUsername}'s Public Page`,
+                        'Scan with any mobile camera to open and access your public bookmark collection'
+                      )
+                    }
+                    title="Show QR Code for your public page"
+                  >
+                    <i className="fa-solid fa-qrcode" style={{ color: 'var(--primary-color)' }}></i> QR Code
+                  </button>
+                  <button
+                    id="subfolderCopyBtn"
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: '6px 12px', fontSize: '0.85rem' }}
+                    onClick={() => handleCopyProfileUrl(userUsername)}
+                    title="Copy public page URL"
+                  >
+                    <i className="fa-regular fa-copy"></i> Copy Link
+                  </button>
+                </div>
+                <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                  Active preview route: {window.location.origin}/{userUsername}
+                </span>
+              </div>
+
+              {/* Stats Summary */}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                <div className="badge" style={{ padding: '6px 12px', fontSize: '0.8rem' }}>
+                  <strong>{links.length}</strong> Total Links
+                </div>
+                <div
+                  className="badge"
+                  style={{
+                    padding: '6px 12px',
+                    fontSize: '0.8rem',
+                    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+                    color: '#10b981',
+                    borderColor: 'rgba(16, 185, 129, 0.3)',
+                  }}
+                >
+                  <i className="fa-solid fa-globe"></i> <strong>{links.filter((l) => l.isPublic).length}</strong> Public
+                </div>
+                <div
+                  className="badge"
+                  style={{
+                    padding: '6px 12px',
+                    fontSize: '0.8rem',
+                    backgroundColor: 'rgba(100, 116, 139, 0.12)',
+                    color: 'var(--text-secondary)',
+                    borderColor: 'var(--border-color)',
+                  }}
+                >
+                  <i className="fa-solid fa-lock"></i> <strong>{links.filter((l) => !l.isPublic).length}</strong> Private
+                </div>
+              </div>
+            </div>
+
+            {/* Category Share Links Card */}
+            <div className="category-manager-card" id="settingsCategoryCard" style={{ marginTop: '16px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '14px' }}>
+                <div>
+                  <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+                    <i className="fa-solid fa-folder-tree" style={{ color: 'var(--primary-color)', marginRight: '8px' }}></i>
+                    Category Public Share Links
+                  </h4>
+                  <p style={{ margin: '4px 0 0 0', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                    Share specific category links directly with viewers (e.g., /exam-links, /favourites, /tools).
+                  </p>
+                </div>
+                <button
+                  id="settingsAddCategoryToggleBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+                  onClick={() => setShowAddCategorySidebar(!showAddCategorySidebar)}
+                >
+                  <i className="fa-solid fa-plus"></i> Add Category
+                </button>
+              </div>
+
+              {showAddCategorySidebar && (
+                <div style={{ background: 'var(--card-bg)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', marginBottom: '14px' }}>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (sidebarCategoryInput.trim()) {
+                        handleAddCategory(sidebarCategoryInput.trim());
+                        setSidebarCategoryInput('');
+                        setShowAddCategorySidebar(false);
+                      }
+                    }}
+                    style={{ display: 'flex', gap: '8px' }}
+                  >
+                    <input
+                      type="text"
+                      className="form-control"
+                      placeholder="Category name, e.g. Exam Links"
+                      value={sidebarCategoryInput}
+                      onChange={(e) => setSidebarCategoryInput(e.target.value)}
+                      style={{ flex: 1, padding: '6px 12px', fontSize: '0.85rem' }}
+                      autoFocus
+                    />
+                    <button type="submit" className="btn btn-primary" style={{ padding: '6px 14px', fontSize: '0.85rem' }}>
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ padding: '6px 12px', fontSize: '0.85rem' }}
+                      onClick={() => setShowAddCategorySidebar(false)}
+                    >
+                      Cancel
+                    </button>
+                  </form>
+                </div>
+              )}
+
+              <div className="category-share-list" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '10px' }}>
+                {/* Favorites link */}
+                <div className="category-share-item">
+                  <div className="category-share-item-header">
+                    <span style={{ fontWeight: 600, fontSize: '0.86rem', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                      <i className="fa-solid fa-star" style={{ color: '#f59e0b' }}></i> Favourites
+                    </span>
+                    <span className="badge" style={{ fontSize: '0.7rem' }}>
+                      {counts.Favorites} items
+                    </span>
+                  </div>
+                  <div className="category-share-url-preview">
+                    https://linkmanager.in/{userUsername}/favourites
+                  </div>
+                  <div className="category-share-item-actions">
+                    <button
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.75rem', padding: '4px 8px', flex: 1 }}
+                      onClick={() => handleCopyCategoryShareUrl('Favourites')}
+                    >
+                      <i className="fa-regular fa-copy"></i> Copy Link
+                    </button>
+                    <button
+                      className="btn btn-secondary"
+                      id="settingsFavouritesQrBtn"
+                      style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+                      onClick={() =>
+                        handleOpenQrModal(
+                          getCategoryShareUrl('Favourites'),
+                          'Favourites Links',
+                          'Scan to open favourite bookmarks directly on your mobile device',
+                          'Favourites'
+                        )
+                      }
+                      title="Show QR Code for Favourites"
+                    >
+                      <i className="fa-solid fa-qrcode"></i> QR
+                    </button>
+                    <button
+                      className="btn btn-outline-sm"
+                      style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+                      onClick={() => handleNavigateToPublicProfile(userUsername, 'favourites')}
+                    >
+                      <i className="fa-solid fa-arrow-up-right-from-square"></i> View
+                    </button>
+                  </div>
+                </div>
+
+                {/* All categories */}
+                {allCategories.map((cat) => {
+                  const slug = slugifyCategory(cat);
+                  const count = counts[cat] || 0;
+                  return (
+                    <div className="category-share-item" key={cat}>
+                      <div className="category-share-item-header">
+                        <span style={{ fontWeight: 600, fontSize: '0.86rem', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                          <i className="fa-solid fa-folder-open" style={{ color: 'var(--primary-color)' }}></i> {cat}
+                        </span>
+                        <span className="badge" style={{ fontSize: '0.7rem' }}>
+                          {count} items
+                        </span>
+                      </div>
+                      <div className="category-share-url-preview">
+                        https://linkmanager.in/{userUsername}/{slug}
+                      </div>
+                      <div className="category-share-item-actions">
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.75rem', padding: '4px 8px', flex: 1 }}
+                          onClick={() => handleCopyCategoryShareUrl(cat)}
+                        >
+                          <i className="fa-regular fa-copy"></i> Copy Link
+                        </button>
+                        <button
+                          className="btn btn-secondary"
+                          id={`settingsCatQrBtn-${slug}`}
+                          style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+                          onClick={() =>
+                            handleOpenQrModal(
+                              getCategoryShareUrl(cat),
+                              `${cat} Links`,
+                              `Scan to view @${userUsername}'s ${cat} collection on mobile`,
+                              cat
+                            )
+                          }
+                          title={`Show QR Code for ${cat}`}
+                        >
+                          <i className="fa-solid fa-qrcode"></i> QR
+                        </button>
+                        <button
+                          className="btn btn-outline-sm"
+                          style={{ fontSize: '0.75rem', padding: '4px 8px' }}
+                          onClick={() => handleNavigateToPublicProfile(userUsername, slug)}
+                        >
+                          <i className="fa-solid fa-arrow-up-right-from-square"></i> View
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Links Management List: Toggle Public/Private, Edit, Delete */}
+          <div className="settings-links-card" id="settingsLinksCard">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
+              <h3 style={{ fontSize: '1.1rem', margin: 0, fontWeight: 600 }}>
+                Manage Links & Privacy ({settingsFilteredLinks.length})
+              </h3>
+
+              {/* Filters */}
+              <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                <div className="search-box" style={{ width: '200px', height: '36px' }}>
+                  <i className="fa-solid fa-magnifying-glass"></i>
+                  <input
+                    type="text"
+                    id="settingsSearchInput"
+                    placeholder="Search links..."
+                    value={settingsSearch}
+                    onChange={(e) => setSettingsSearch(e.target.value)}
+                  />
+                </div>
+
+                <select
+                  id="settingsCategorySelect"
+                  className="form-control"
+                  style={{ width: '130px', padding: '6px 10px', fontSize: '0.85rem' }}
+                  value={settingsCategoryFilter}
+                  onChange={(e) => setSettingsCategoryFilter(e.target.value)}
+                >
+                  <option value="All">All Categories</option>
+                  <option value="Work">Work</option>
+                  <option value="Social">Social</option>
+                  <option value="Tools">Tools</option>
+                  <option value="Reading">Reading</option>
+                  <option value="Personal">Personal</option>
+                </select>
+
+                <div style={{ display: 'flex', background: 'var(--bg-color)', borderRadius: '6px', border: '1px solid var(--border-color)', padding: '2px' }}>
+                  <button
+                    className={`filter-btn ${settingsVisibilityFilter === 'all' ? 'active' : ''}`}
+                    onClick={() => setSettingsVisibilityFilter('all')}
+                    style={{ border: 'none', background: settingsVisibilityFilter === 'all' ? 'var(--card-bg)' : 'transparent', padding: '4px 10px', fontSize: '0.8rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 500 }}
+                  >
+                    All ({links.length})
+                  </button>
+                  <button
+                    className={`filter-btn ${settingsVisibilityFilter === 'public' ? 'active' : ''}`}
+                    onClick={() => setSettingsVisibilityFilter('public')}
+                    style={{ border: 'none', background: settingsVisibilityFilter === 'public' ? 'var(--card-bg)' : 'transparent', padding: '4px 10px', fontSize: '0.8rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 500, color: settingsVisibilityFilter === 'public' ? '#10b981' : undefined }}
+                  >
+                    Public ({links.filter((l) => l.isPublic).length})
+                  </button>
+                  <button
+                    className={`filter-btn ${settingsVisibilityFilter === 'private' ? 'active' : ''}`}
+                    onClick={() => setSettingsVisibilityFilter('private')}
+                    style={{ border: 'none', background: settingsVisibilityFilter === 'private' ? 'var(--card-bg)' : 'transparent', padding: '4px 10px', fontSize: '0.8rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 500 }}
+                  >
+                    Private ({links.filter((l) => !l.isPublic).length})
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* List of Links */}
+            <div className="settings-links-list" id="settingsLinksList">
+              {settingsFilteredLinks.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '36px 16px', color: 'var(--text-secondary)' }}>
+                  <i className="fa-solid fa-filter" style={{ fontSize: '2rem', marginBottom: '8px', opacity: 0.5 }}></i>
+                  <p style={{ margin: 0 }}>No links match the selected filter or search.</p>
+                </div>
+              ) : (
+                settingsFilteredLinks.map((link) => {
+                  const domain = getDomain(link.url);
+                  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+                  return (
+                    <div className="settings-link-row" key={link.id} id={`settings-row-${link.id}`}>
+                      <div className="settings-row-info">
+                        <img
+                          src={faviconUrl}
+                          className="favicon"
+                          alt="Favicon"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src = 'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                          }}
+                        />
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <h4 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 600 }}>{link.title}</h4>
+                            <span className="badge" style={{ fontSize: '0.7rem', padding: '2px 8px' }}>{link.category}</span>
+                          </div>
+                          <span className="domain-tag" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                            {link.url}
+                          </span>
+                          {link.description && (
+                            <p style={{ margin: '4px 0 0 0', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+                              {link.description}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="settings-row-actions">
+                        {/* Public / Private Toggle Switch */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <label className="toggle-switch" title="Toggle Public / Private visibility">
+                            <input
+                              type="checkbox"
+                              id={`togglePublic-${link.id}`}
+                              checked={Boolean(link.isPublic)}
+                              onChange={() => handleTogglePublic(link)}
+                            />
+                            <span className="toggle-slider"></span>
+                          </label>
+                          <span
+                            style={{
+                              fontSize: '0.82rem',
+                              fontWeight: 600,
+                              width: '50px',
+                              color: link.isPublic ? '#10b981' : 'var(--text-secondary)',
+                            }}
+                          >
+                            {link.isPublic ? 'Public' : 'Private'}
+                          </span>
+                        </div>
+
+                        {/* Action Buttons: Favorite Star, Copy, Open, Edit Info, Delete */}
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                          <button
+                            id={`settingsFavBtn-${link.id}`}
+                            className={`btn btn-outline-sm ${link.isFavorite ? 'favorite-star-btn is-active' : ''}`}
+                            onClick={() => handleToggleFavorite(link)}
+                            title={link.isFavorite ? 'Unpin from favorites' : 'Pin to top as favorite'}
+                            style={{
+                              padding: '6px 10px',
+                              color: link.isFavorite ? '#f59e0b' : 'var(--text-secondary)',
+                              borderColor: link.isFavorite ? 'rgba(245, 158, 11, 0.4)' : undefined,
+                              backgroundColor: link.isFavorite ? 'rgba(245, 158, 11, 0.1)' : undefined,
+                            }}
+                          >
+                            <i className={link.isFavorite ? 'fa-solid fa-star' : 'fa-regular fa-star'}></i>
+                          </button>
+                          <button
+                            id={`settingsCopyBtn-${link.id}`}
+                            className="btn btn-outline-sm"
+                            onClick={() => copyToClipboard(link.url)}
+                            title="Copy URL"
+                            style={{ padding: '6px 10px' }}
+                          >
+                            <i className="fa-regular fa-copy"></i>
+                          </button>
+                          <a
+                            id={`settingsOpenBtn-${link.id}`}
+                            className="btn btn-outline-sm"
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Open link"
+                            style={{ padding: '6px 10px', textDecoration: 'none' }}
+                          >
+                            <i className="fa-solid fa-arrow-up-right-from-square"></i>
+                          </a>
+                          <button
+                            id={`settingsEditBtn-${link.id}`}
+                            className="btn btn-secondary"
+                            onClick={() => handleOpenEditModal(link)}
+                            title="Edit link information"
+                            style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                          >
+                            <i className="fa-regular fa-pen-to-square"></i> Edit Info
+                          </button>
+                          <button
+                            id={`settingsDeleteBtn-${link.id}`}
+                            className="btn btn-outline-sm delete-btn"
+                            onClick={() => handleOpenDeleteModal(link)}
+                            title="Delete Link"
+                            style={{ padding: '6px 10px', color: '#ef4444' }}
+                          >
+                            <i className="fa-regular fa-trash-can"></i>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* VIEW 3: Public Profile Page (https://linkmanager.in/{username}) */}
+      {currentView === 'public_profile' && (
+        <div className="public-profile-wrapper" id="publicProfileWrapper">
+          {/* Public Top Navbar */}
+          <header className="navbar" id="publicNavbar">
+            <div className="logo" id="publicAppLogo" onClick={handleBackToDashboard} style={{ cursor: 'pointer' }}>
+              <i className="fa-solid fa-link logo-icon"></i>
+              <span>
+                LinkManager<span className="domain">.in</span>
+              </span>
+            </div>
+
+            <div className="nav-controls">
+              {currentUser ? (
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button
+                    id="publicToSettingsBtn"
+                    className="btn btn-secondary"
+                    onClick={() => setCurrentView('settings')}
+                    style={{ fontSize: '0.85rem' }}
+                  >
+                    <i className="fa-solid fa-sliders"></i> Link Settings
+                  </button>
+                  <button
+                    id="publicToDashboardBtn"
+                    className="btn btn-primary"
+                    onClick={handleBackToDashboard}
+                    style={{ fontSize: '0.85rem' }}
+                  >
+                    <i className="fa-solid fa-table-columns"></i> My Dashboard
+                  </button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button
+                    id="publicLoginBtn"
+                    className="btn btn-secondary"
+                    onClick={() => {
+                      setIsLoginMode(true);
+                      setIsAuthModalOpen(true);
+                    }}
+                    style={{ fontSize: '0.85rem' }}
+                  >
+                    <i className="fa-solid fa-user"></i> Log In
+                  </button>
+                  <button
+                    id="publicSignupBtn"
+                    className="btn btn-primary"
+                    onClick={() => {
+                      setIsLoginMode(false);
+                      setIsAuthModalOpen(true);
+                    }}
+                    style={{ fontSize: '0.85rem' }}
+                  >
+                    Create Free LinkManager
+                  </button>
+                </div>
+              )}
+            </div>
+          </header>
+
+          {/* Owner Preview Banner */}
+          {currentUser && (userUsername === publicProfileUsername || currentUser.uid === publicProfileUser?.uid) && (
+            <div
+              id="ownerPreviewBanner"
+              style={{
+                backgroundColor: 'rgba(37, 99, 235, 0.08)',
+                borderBottom: '1px solid rgba(37, 99, 235, 0.2)',
+                padding: '8px 24px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                fontSize: '0.85rem',
+                color: 'var(--primary-color)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <i className="fa-regular fa-eye"></i>
+                <span>You are viewing your public page as visitors see it.</span>
+              </div>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: '0.78rem', padding: '4px 10px' }}
+                onClick={() => setCurrentView('settings')}
+              >
+                <i className="fa-solid fa-sliders"></i> Manage in Link Settings
+              </button>
             </div>
           )}
-        </main>
-      </div>
+
+          {/* Public Profile Main Content */}
+          <div className="public-profile-content">
+            {/* Hero Profile Card */}
+            <div className="public-profile-hero" id="publicProfileHero">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+                {publicProfileUser?.photoURL ? (
+                  <img
+                    src={publicProfileUser.photoURL}
+                    alt="User avatar"
+                    className="public-avatar"
+                  />
+                ) : (
+                  <div className="public-avatar">
+                    {(publicProfileUser?.displayName || publicProfileUsername || 'U')[0].toUpperCase()}
+                  </div>
+                )}
+
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <h2 style={{ margin: 0, fontSize: '1.45rem', fontWeight: 700 }}>
+                      {publicProfileUser?.displayName || publicProfileUsername}
+                    </h2>
+                    <span
+                      className="badge"
+                      style={{
+                        backgroundColor: 'rgba(16, 185, 129, 0.12)',
+                        color: '#10b981',
+                        borderColor: 'rgba(16, 185, 129, 0.3)',
+                        fontSize: '0.75rem',
+                      }}
+                    >
+                      <i className="fa-solid fa-globe"></i> Public Collection
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                    <span style={{ fontWeight: 600, color: 'var(--primary-color)' }}>
+                      @{publicProfileUser?.username || publicProfileUsername}
+                    </span>
+                    <span>•</span>
+                    <span>{publicFilteredLinks.length} public link{publicFilteredLinks.length === 1 ? '' : 's'} shared</span>
+                  </div>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                    https://linkmanager.in/{publicProfileUser?.username || publicProfileUsername}
+                  </span>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <button
+                  id="sharePublicProfileBtn"
+                  className="btn btn-primary"
+                  onClick={() => handleCopyProfileUrl(publicProfileUsername)}
+                  style={{ fontSize: '0.85rem' }}
+                >
+                  <i className="fa-solid fa-share-nodes"></i> Share Public Page
+                </button>
+                <button
+                  id="publicProfileQrBtn"
+                  className="btn btn-secondary"
+                  onClick={() =>
+                    handleOpenQrModal(
+                      getProfileShareUrl(publicProfileUsername),
+                      `@${publicProfileUser?.displayName || publicProfileUsername}'s Links`,
+                      'Scan this QR code with any smartphone camera to open and bookmark these links on mobile'
+                    )
+                  }
+                  style={{ fontSize: '0.85rem' }}
+                  title="Generate QR code for this public page"
+                >
+                  <i className="fa-solid fa-qrcode" style={{ color: 'var(--primary-color)' }}></i> QR Code
+                </button>
+              </div>
+            </div>
+
+            {/* Active Category Filter Banner */}
+            {publicCategory !== 'All' && (
+              <div className="category-view-banner" id="publicCategoryActiveBanner">
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                  <button
+                    id="backToAllCategoriesBtn"
+                    className="btn btn-secondary back-to-all-btn"
+                    onClick={handleBackToAllCategories}
+                  >
+                    <i className="fa-solid fa-arrow-left"></i> Back to all categories
+                  </button>
+                  <div className="category-view-info">
+                    <span>Category:</span>
+                    <span className="category-pill-badge">
+                      {publicCategory === 'Favourites' || publicCategory === 'Favorites' ? (
+                        <i className="fa-solid fa-star" style={{ color: '#f59e0b' }}></i>
+                      ) : (
+                        <i className="fa-solid fa-folder-open"></i>
+                      )}
+                      {publicCategory}
+                    </span>
+                    <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                      ({publicFilteredLinks.length} link{publicFilteredLinks.length === 1 ? '' : 's'})
+                    </span>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button
+                    id="copyCategoryPublicUrlBtn"
+                    className="btn btn-outline-sm"
+                    onClick={() => handleCopyCategoryShareUrl(publicCategory, publicProfileUsername)}
+                    title={`Copy share link for ${publicCategory}`}
+                  >
+                    <i className="fa-solid fa-link"></i> Copy Category Link
+                  </button>
+                  <button
+                    id="categoryQrBtn"
+                    className="btn btn-outline-sm"
+                    onClick={() =>
+                      handleOpenQrModal(
+                        getCategoryShareUrl(publicCategory, publicProfileUsername),
+                        `${publicCategory} Category`,
+                        `Scan to open @${publicProfileUsername}'s ${publicCategory} bookmarks on your mobile phone`,
+                        publicCategory
+                      )
+                    }
+                    title={`Show QR code for ${publicCategory}`}
+                  >
+                    <i className="fa-solid fa-qrcode"></i> QR Code
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Public Links Filter Bar */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '20px' }}>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  id="publicCatAllBtn"
+                  className={`btn ${publicCategory === 'All' ? 'btn-primary' : 'btn-secondary'}`}
+                  style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                  onClick={() => handleSelectPublicCategory('All')}
+                >
+                  All
+                </button>
+                {hasPublicFavorites && (
+                  <button
+                    id="publicCatFavBtn"
+                    className={`btn ${publicCategory === 'Favourites' || publicCategory === 'Favorites' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                    onClick={() => handleSelectPublicCategory('Favourites')}
+                  >
+                    <i className="fa-solid fa-star" style={{ color: '#f59e0b', marginRight: '4px' }}></i> Favorites
+                  </button>
+                )}
+                {availablePublicCategories.map((cat) => (
+                  <button
+                    key={cat}
+                    id={`publicCatBtn-${slugifyCategory(cat)}`}
+                    className={`btn ${publicCategory === cat ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                    onClick={() => handleSelectPublicCategory(cat)}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+
+              <div className="search-box" style={{ width: '240px', height: '36px' }}>
+                <i className="fa-solid fa-magnifying-glass"></i>
+                <input
+                  type="text"
+                  id="publicSearchInput"
+                  placeholder="Search shared links..."
+                  value={publicSearch}
+                  onChange={(e) => setPublicSearch(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* Public Links Grid */}
+            {publicProfileLoading ? (
+              <div style={{ textAlign: 'center', padding: '60px 16px', color: 'var(--text-secondary)' }}>
+                <i className="fa-solid fa-circle-notch fa-spin" style={{ fontSize: '2rem', color: 'var(--primary-color)', marginBottom: '12px' }}></i>
+                <p>Loading public links...</p>
+              </div>
+            ) : publicFilteredLinks.length === 0 ? (
+              <div className="empty-state" id="publicEmptyState" style={{ background: 'var(--card-bg)', borderRadius: '12px', border: '1px solid var(--border-color)', padding: '48px 24px' }}>
+                <i className="fa-solid fa-globe" style={{ fontSize: '2.5rem', color: 'var(--text-secondary)', opacity: 0.5, marginBottom: '12px' }}></i>
+                <h3>No public links found</h3>
+                <p style={{ color: 'var(--text-secondary)', marginBottom: publicCategory !== 'All' ? '16px' : 0 }}>
+                  @{publicProfileUsername} hasn't shared any public links {publicCategory !== 'All' ? `in the "${publicCategory}" category` : 'matching this search'} yet.
+                </p>
+                {publicCategory !== 'All' && (
+                  <button
+                    id="emptyStateBackToAllBtn"
+                    className="btn btn-secondary back-to-all-btn"
+                    onClick={handleBackToAllCategories}
+                  >
+                    <i className="fa-solid fa-arrow-left"></i> Back to all categories
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="links-grid" id="publicLinksGrid">
+                {publicFilteredLinks.map((link) => {
+                  const domain = getDomain(link.url);
+                  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+                  return (
+                    <div className="card" key={link.id} id={`public-card-${link.id}`}>
+                      <div>
+                        <div className="card-header">
+                          <img
+                            src={faviconUrl}
+                            className="favicon"
+                            alt="Icon"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).src =
+                                'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                            }}
+                          />
+                          <div className="card-title-area">
+                            <a
+                              href={link.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="card-title-link"
+                              id={`publicTitleLink-${link.id}`}
+                              title={`Open ${link.title}`}
+                            >
+                              <h4>{link.title}</h4>
+                            </a>
+                            <span className="domain-tag">{domain}</span>
+                          </div>
+                        </div>
+                        <p className="card-description">
+                          {link.description || 'No description added.'}
+                        </p>
+                      </div>
+                      <div className="card-footer">
+                        <span
+                          className="badge"
+                          style={{ cursor: 'pointer' }}
+                          title={`Filter by ${link.category}`}
+                          onClick={() => handleSelectPublicCategory(link.category)}
+                        >
+                          {link.category}
+                        </span>
+                        <div className="card-actions">
+                          <button
+                            id={`publicQrBtn-${link.id}`}
+                            onClick={() =>
+                              handleOpenQrModal(
+                                link.url,
+                                link.title,
+                                'Scan with smartphone camera to open link on mobile',
+                                link.category
+                              )
+                            }
+                            title="Scan QR Code to open on mobile"
+                          >
+                            <i className="fa-solid fa-qrcode"></i>
+                          </button>
+                          <button
+                            id={`publicCopyBtn-${link.id}`}
+                            onClick={() => copyToClipboard(link.url)}
+                            title="Copy URL"
+                          >
+                            <i className="fa-regular fa-copy"></i>
+                          </button>
+                          <a
+                            id={`publicOpenBtn-${link.id}`}
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Open Link in New Tab"
+                          >
+                            <i className="fa-solid fa-arrow-up-right-from-square"></i>
+                          </a>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Modal Dialog: Add / Edit Link */}
       {isLinkModalOpen && (
@@ -1122,18 +3114,67 @@ export default function App() {
                 />
               </div>
               <div className="form-group">
-                <label htmlFor="linkCategory">Category</label>
-                <select
-                  id="linkCategory"
-                  value={formCategory}
-                  onChange={(e) => setFormCategory(e.target.value)}
-                >
-                  <option value="Work">Work</option>
-                  <option value="Social">Social</option>
-                  <option value="Tools">Tools</option>
-                  <option value="Reading">Reading</option>
-                  <option value="Personal">Personal</option>
-                </select>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                  <label htmlFor="linkCategory" style={{ margin: 0 }}>Category</label>
+                  <button
+                    type="button"
+                    className="btn-icon-subtle"
+                    style={{ fontSize: '0.78rem', color: 'var(--primary-color)', background: 'none', border: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                    onClick={() => setIsAddingCustomCategoryInModal(!isAddingCustomCategoryInModal)}
+                  >
+                    <i className={`fa-solid ${isAddingCustomCategoryInModal ? 'fa-list' : 'fa-plus'}`}></i>
+                    {isAddingCustomCategoryInModal ? 'Existing Categories' : 'New Category'}
+                  </button>
+                </div>
+
+                {!isAddingCustomCategoryInModal ? (
+                  <select
+                    id="linkCategory"
+                    value={formCategory}
+                    onChange={(e) => {
+                      if (e.target.value === '__add_new__') {
+                        setIsAddingCustomCategoryInModal(true);
+                      } else {
+                        setFormCategory(e.target.value);
+                      }
+                    }}
+                  >
+                    {allCategories.map((cat) => (
+                      <option key={cat} value={cat}>
+                        {cat}
+                      </option>
+                    ))}
+                    <option value="__add_new__">+ Add New Category...</option>
+                  </select>
+                ) : (
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <input
+                      type="text"
+                      id="modalNewCategoryInput"
+                      className="form-control"
+                      placeholder="e.g. Exam Links"
+                      value={modalNewCategoryText}
+                      onChange={(e) => setModalNewCategoryText(e.target.value)}
+                      autoFocus
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+                      onClick={() => {
+                        if (modalNewCategoryText.trim()) {
+                          const newCat = modalNewCategoryText.trim();
+                          handleAddCategory(newCat);
+                          setFormCategory(newCat);
+                          setIsAddingCustomCategoryInModal(false);
+                          setModalNewCategoryText('');
+                        }
+                      }}
+                    >
+                      Save
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="form-group">
                 <label htmlFor="linkDescription">Notes / Description (Optional)</label>
@@ -1144,6 +3185,24 @@ export default function App() {
                   value={formDescription}
                   onChange={(e) => setFormDescription(e.target.value)}
                 ></textarea>
+              </div>
+
+              <div className="public-switch-bar" style={{ marginBottom: '1rem', marginTop: 0 }}>
+                <div className="switch-label">
+                  <span className="title" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <i className="fa-solid fa-star" style={{ color: '#f59e0b', fontSize: '0.85rem' }}></i> Pin as Favorite
+                  </span>
+                  <span className="desc">Pin this link to the top of your dashboard grid</span>
+                </div>
+                <label className="toggle-switch" htmlFor="formIsFavoriteToggle">
+                  <input
+                    type="checkbox"
+                    id="formIsFavoriteToggle"
+                    checked={formIsFavorite}
+                    onChange={(e) => setFormIsFavorite(e.target.checked)}
+                  />
+                  <span className="toggle-slider"></span>
+                </label>
               </div>
 
               <div className="public-switch-bar" style={{ marginBottom: '1.25rem', marginTop: 0 }}>
@@ -1610,6 +3669,23 @@ export default function App() {
                   <i className={shareCopied ? 'fa-solid fa-check' : 'fa-regular fa-copy'}></i>{' '}
                   {shareCopied ? 'Copied' : 'Copy'}
                 </button>
+                <button
+                  type="button"
+                  id="shareModalInlineQrBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.82rem', padding: '8px 12px', whiteSpace: 'nowrap' }}
+                  onClick={() =>
+                    handleOpenQrModal(
+                      getPublicShareUrl(sharingLink),
+                      sharingLink.title,
+                      'Scan this QR code with any smartphone camera to open this bookmark',
+                      sharingLink.category
+                    )
+                  }
+                  title="Generate QR Code"
+                >
+                  <i className="fa-solid fa-qrcode" style={{ color: 'var(--primary-color)' }}></i> QR
+                </button>
               </div>
             </div>
 
@@ -1679,8 +3755,24 @@ export default function App() {
               </div>
             </div>
 
-            {/* Extra Options: Native Device Share & Direct URL */}
+            {/* Extra Options: QR Code, Native Device Share & Direct URL */}
             <div style={{ marginTop: '1rem', display: 'flex', gap: '8px' }}>
+              <button
+                type="button"
+                id="shareModalQrCodeBtn"
+                className="btn btn-secondary"
+                style={{ flex: 1, fontSize: '0.82rem', justifyContent: 'center' }}
+                onClick={() =>
+                  handleOpenQrModal(
+                    getPublicShareUrl(sharingLink),
+                    sharingLink.title,
+                    'Scan with your mobile camera to open this bookmark directly on mobile',
+                    sharingLink.category
+                  )
+                }
+              >
+                <i className="fa-solid fa-qrcode" style={{ color: 'var(--primary-color)' }}></i> QR Code
+              </button>
               <button
                 type="button"
                 id="nativeShareBtn"
@@ -1815,6 +3907,16 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Modal Dialog: QR Code Generator & Viewer for Public Link Sharing */}
+      <QrCodeModal
+        isOpen={isQrModalOpen}
+        onClose={() => setIsQrModalOpen(false)}
+        url={qrModalData.url}
+        title={qrModalData.title}
+        subtitle={qrModalData.subtitle}
+        categoryBadge={qrModalData.categoryBadge}
+      />
     </>
   );
 }
