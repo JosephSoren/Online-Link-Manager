@@ -25,6 +25,7 @@ import {
 import { auth, googleProvider, db } from './firebase';
 import jsPDF from 'jspdf';
 import { QrCodeModal } from './components/QrCodeModal';
+import { LandingPage } from './components/LandingPage';
 
 export interface LinkItem {
   id: string;
@@ -126,7 +127,7 @@ const getProfileRouteFromUrl = (): ProfileRoute | null => {
 
   const pathParts = window.location.pathname.replace(/^\/+|\/+$/g, '').split('/');
   const first = pathParts[0]?.toLowerCase().trim();
-  const reserved = ['', 'index.html', 'api', 'assets', 'dashboard', 'settings'];
+  const reserved = ['', 'index.html', 'api', 'assets', 'dashboard', 'settings', 'landing'];
   if (first && !reserved.includes(first)) {
     const second = pathParts[1]?.toLowerCase().trim();
     return {
@@ -159,8 +160,27 @@ export default function App() {
   const [isAddingCustomCategoryInModal, setIsAddingCustomCategoryInModal] = useState(false);
   const [modalNewCategoryText, setModalNewCategoryText] = useState('');
 
-  // View Navigation: 'dashboard' | 'settings' | 'public_profile'
-  const [currentView, setCurrentView] = useState<'dashboard' | 'settings' | 'public_profile'>('dashboard');
+  // View Navigation: 'landing' | 'dashboard' | 'settings' | 'public_profile'
+  const [currentView, setCurrentView] = useState<'landing' | 'dashboard' | 'settings' | 'public_profile'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const vParam = params.get('view');
+    if (vParam === 'landing') return 'landing';
+    if (vParam === 'dashboard') return 'dashboard';
+    if (vParam === 'settings') return 'settings';
+
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+    if (path === 'landing') return 'landing';
+    if (path === 'dashboard') return 'dashboard';
+    if (path === 'settings') return 'settings';
+
+    const profileRoute = getProfileRouteFromUrl();
+    if (profileRoute) return 'public_profile';
+
+    // Check saved preference; default to 'landing' for SEO & new users
+    const pref = localStorage.getItem('lm_preferred_view');
+    if (pref === 'dashboard') return 'dashboard';
+    return 'landing';
+  });
   const [isHeaderMenuOpen, setIsHeaderMenuOpen] = useState(false);
 
   // Drag and drop reordering state
@@ -634,7 +654,17 @@ export default function App() {
         loadPublicProfile(route.username, route.categorySlug);
         setCurrentView('public_profile');
       } else {
-        setCurrentView('dashboard');
+        const path = window.location.pathname.replace(/^\/+|\/+$/g, '').toLowerCase();
+        if (path === 'settings') {
+          setCurrentView('settings');
+        } else if (path === 'dashboard') {
+          setCurrentView('dashboard');
+        } else if (path === 'landing') {
+          setCurrentView('landing');
+        } else {
+          const pref = localStorage.getItem('lm_preferred_view');
+          setCurrentView(pref === 'dashboard' ? 'dashboard' : 'landing');
+        }
       }
     };
     window.addEventListener('popstate', handlePopState);
@@ -685,8 +715,15 @@ export default function App() {
   };
 
   const handleBackToDashboard = () => {
-    window.history.pushState(null, '', '/');
+    localStorage.setItem('lm_preferred_view', 'dashboard');
+    window.history.pushState(null, '', '/dashboard');
     setCurrentView('dashboard');
+  };
+
+  const handleGoToLanding = () => {
+    localStorage.setItem('lm_preferred_view', 'landing');
+    window.history.pushState(null, '', '/');
+    setCurrentView('landing');
   };
 
   const handleCopyProfileUrl = (slug?: string) => {
@@ -1373,6 +1410,7 @@ export default function App() {
     try {
       await signInWithPopup(auth, googleProvider);
       setIsAuthModalOpen(false);
+      handleBackToDashboard();
     } catch (err: any) {
       if (err.code !== 'auth/popup-closed-by-user') {
         setAuthError(err.message || 'Google Sign-in failed');
@@ -1396,6 +1434,7 @@ export default function App() {
         }
       }
       setIsAuthModalOpen(false);
+      handleBackToDashboard();
     } catch (err: any) {
       let msg = err.message || 'Authentication error';
       if (err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential') {
@@ -1559,14 +1598,14 @@ export default function App() {
       )}
 
       {/* Navigation / Header (visible on Dashboard and Settings) */}
-      {currentView !== 'public_profile' && (
+      {(currentView === 'dashboard' || currentView === 'settings') && (
         <header className="navbar" id="navbar">
           <div
             className="logo"
             id="appLogo"
-            onClick={handleBackToDashboard}
+            onClick={handleGoToLanding}
             style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
-            title="Return to Dashboard"
+            title="LinkManager.in - Go to Home Page"
           >
             <i className="fa-solid fa-link logo-icon"></i>
             <span>
@@ -1604,6 +1643,18 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              {/* Product Home Button */}
+              <button
+                id="navLandingBtn"
+                className="btn btn-secondary"
+                title="Go to Home Page & Overview"
+                onClick={handleGoToLanding}
+                style={{ fontSize: '0.82rem', padding: '6px 12px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+              >
+                <i className="fa-solid fa-house" style={{ color: 'var(--primary-color)' }}></i>
+                <span>Home</span>
+              </button>
 
               <button
                 id="themeToggleBtn"
@@ -1694,9 +1745,20 @@ export default function App() {
       )}
 
       {/* Mobile Sub-Header: Placed immediately after header in mobile screen sizes */}
-      {currentView !== 'public_profile' && (
+      {(currentView === 'dashboard' || currentView === 'settings') && (
         <div className="mobile-header-subbar" id="mobileHeaderSubbar">
           <div className="mobile-subbar-controls">
+            <button
+              id="mobileNavLandingBtn"
+              className="btn btn-secondary"
+              title="Go to Home Page & Overview"
+              onClick={handleGoToLanding}
+              style={{ fontSize: '0.78rem', padding: '4px 9px', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              <i className="fa-solid fa-house" style={{ color: 'var(--primary-color)' }}></i>
+              <span>Home</span>
+            </button>
+
             <button
               id="mobileThemeToggleBtn"
               className="icon-btn"
@@ -1774,11 +1836,50 @@ export default function App() {
         </div>
       )}
 
+      {/* VIEW 0: SEO-Optimized Landing Page for New Visitors & Search Crawlers */}
+      {currentView === 'landing' && (
+        <LandingPage
+          onLaunchDashboard={handleBackToDashboard}
+          onOpenAuth={() => {
+            setIsLoginMode(false);
+            setIsAuthModalOpen(true);
+          }}
+          currentUser={currentUser}
+          isDarkMode={isDarkMode}
+          toggleTheme={toggleTheme}
+          userUsername={userUsername}
+          onViewPublicProfile={handleNavigateToPublicProfile}
+        />
+      )}
+
       {/* VIEW 1: Dashboard Main Container */}
       {currentView === 'dashboard' && (
         <div className="app-container" id="appContainer">
           {/* Sidebar: Categories */}
           <aside className="sidebar" id="sidebar">
+            {/* Quick Home navigation button */}
+            <div style={{ marginBottom: '12px', paddingBottom: '10px', borderBottom: '1px solid var(--border-color)' }}>
+              <button
+                id="sidebarGoHomeBtn"
+                onClick={handleGoToLanding}
+                className="btn btn-secondary"
+                style={{
+                  width: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  justifyContent: 'flex-start',
+                  fontSize: '0.82rem',
+                  padding: '7px 12px',
+                  borderRadius: '6px',
+                }}
+                title="Go to LinkManager.in Home & Features Overview"
+              >
+                <i className="fa-solid fa-house" style={{ color: 'var(--primary-color)' }}></i>
+                <span>Home Page / Overview</span>
+              </button>
+            </div>
+
             <div className="sidebar-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <h3>Categories</h3>
               <button
@@ -2018,6 +2119,16 @@ export default function App() {
                         }}
                       >
                         <i className="fa-solid fa-globe" style={{ color: 'var(--accent-green)' }}></i> View Public Page
+                      </button>
+                      <button
+                        className="dropdown-item"
+                        id="menuLandingOverviewBtn"
+                        onClick={() => {
+                          setIsHeaderMenuOpen(false);
+                          handleGoToLanding();
+                        }}
+                      >
+                        <i className="fa-solid fa-house" style={{ color: '#6366f1' }}></i> Product Overview
                       </button>
                       <button
                         className="dropdown-item"
@@ -2699,7 +2810,7 @@ export default function App() {
         <div className="public-profile-wrapper" id="publicProfileWrapper">
           {/* Public Top Navbar */}
           <header className="navbar" id="publicNavbar">
-            <div className="logo" id="publicAppLogo" onClick={handleBackToDashboard} style={{ cursor: 'pointer' }}>
+            <div className="logo" id="publicAppLogo" onClick={handleGoToLanding} style={{ cursor: 'pointer' }} title="LinkManager.in Home">
               <i className="fa-solid fa-link logo-icon"></i>
               <span>
                 LinkManager<span className="domain">.in</span>
@@ -2709,6 +2820,15 @@ export default function App() {
             <div className="nav-controls">
               {currentUser ? (
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button
+                    id="publicToHomeBtn"
+                    className="btn btn-secondary"
+                    onClick={handleGoToLanding}
+                    style={{ fontSize: '0.85rem' }}
+                    title="Product Overview & Features"
+                  >
+                    <i className="fa-solid fa-house"></i> Home
+                  </button>
                   <button
                     id="publicToSettingsBtn"
                     className="btn btn-secondary"
@@ -2728,6 +2848,15 @@ export default function App() {
                 </div>
               ) : (
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button
+                    id="publicToHomeBtn"
+                    className="btn btn-secondary"
+                    onClick={handleGoToLanding}
+                    style={{ fontSize: '0.85rem' }}
+                    title="Product Overview & Features"
+                  >
+                    <i className="fa-solid fa-house"></i> Home
+                  </button>
                   <button
                     id="publicLoginBtn"
                     className="btn btn-secondary"

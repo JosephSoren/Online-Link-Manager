@@ -1,6 +1,6 @@
 {
   "name": "LinkManager.in",
-  "description": "All your links in one place. Bookmark, organize, and access links across categories with Firebase authentication.",
+  "description": "The smart bookmark and link manager. Organize, categorize, search, and share your links across desktop and mobile with instant QR codes, public profiles, PDF export, and cloud sync.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
