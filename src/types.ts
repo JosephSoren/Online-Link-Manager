@@ -1,3 +1,21 @@
+export type LinktreeButtonStyle = 'pill' | 'rounded' | 'hard' | 'outline' | 'shadow';
+export type PublicLayoutView = 'linktree' | 'compact' | 'cards';
+
+export interface SocialLinks {
+  instagram?: string;
+  twitter?: string;
+  github?: string;
+  youtube?: string;
+  linkedin?: string;
+  tiktok?: string;
+  twitch?: string;
+  spotify?: string;
+  discord?: string;
+  email?: string;
+  whatsapp?: string;
+  website?: string;
+}
+
 export interface LinkItem {
   id: string;
   title: string;
@@ -8,6 +26,27 @@ export interface LinkItem {
   createdAt: string;
   userId?: string;
   favorite?: boolean;
+  isPublic?: boolean;
+  isFavorite?: boolean;
+  order?: number;
+  clickCount?: number;
+  isHighlighted?: boolean;
+}
+
+export interface UserProfile {
+  uid: string;
+  username: string;
+  displayName: string;
+  photoURL?: string;
+  email?: string;
+  bio?: string;
+  themeTemplate?: string;
+  bannerStyle?: string;
+  bannerUrl?: string;
+  buttonStyle?: LinktreeButtonStyle;
+  defaultView?: PublicLayoutView;
+  verifiedBadge?: boolean;
+  socialLinks?: SocialLinks;
 }
 
 export type CategoryType = 'All' | 'Work' | 'Social' | 'Tools' | 'Reading' | 'Personal';

@@ -20,12 +20,27 @@ import {
   onSnapshot,
   query,
   orderBy,
-  writeBatch
+  writeBatch,
+  increment,
 } from 'firebase/firestore';
 import { auth, googleProvider, db } from './firebase';
 import jsPDF from 'jspdf';
 import { QrCodeModal } from './components/QrCodeModal';
 import { LandingPage } from './components/LandingPage';
+import {
+  ProfileTheme,
+  PROFILE_THEMES,
+  THEME_LIST,
+  PRESET_AVATARS,
+  PRESET_BANNERS,
+  getThemeById,
+  getBannerSvg,
+} from './profileThemes';
+import {
+  LinktreeButtonStyle,
+  PublicLayoutView,
+  SocialLinks,
+} from './types';
 
 export interface LinkItem {
   id: string;
@@ -39,6 +54,8 @@ export interface LinkItem {
   isPublic?: boolean;
   isFavorite?: boolean;
   order?: number;
+  clickCount?: number;
+  isHighlighted?: boolean;
 }
 
 export interface PublicUserProfile {
@@ -47,6 +64,14 @@ export interface PublicUserProfile {
   photoURL?: string;
   email?: string;
   uid?: string;
+  bio?: string;
+  themeTemplate?: ProfileTheme['id'];
+  bannerStyle?: string;
+  bannerUrl?: string;
+  buttonStyle?: LinktreeButtonStyle;
+  defaultView?: PublicLayoutView;
+  verifiedBadge?: boolean;
+  socialLinks?: SocialLinks;
 }
 
 const INITIAL_LINKS: LinkItem[] = [
@@ -60,6 +85,8 @@ const INITIAL_LINKS: LinkItem[] = [
     isPublic: true,
     isFavorite: true,
     order: 0,
+    clickCount: 0,
+    isHighlighted: true,
   },
   {
     id: '2',
@@ -71,6 +98,7 @@ const INITIAL_LINKS: LinkItem[] = [
     isPublic: true,
     isFavorite: false,
     order: 1,
+    clickCount: 0,
   }
 ];
 
@@ -183,15 +211,103 @@ export default function App() {
   });
   const [isHeaderMenuOpen, setIsHeaderMenuOpen] = useState(false);
 
+  // View mode state for links cards: 'cards' (standard full details) vs 'compact' (short tab in one line)
+  // Default to Short Tab (compact) on tablet and small screen devices (<= 1024px)
+  const [isCompactView, setIsCompactView] = useState<boolean>(() => {
+    try {
+      if (typeof window !== 'undefined' && window.innerWidth <= 1024) {
+        // User request: keep short tab as default in tablet and in small screen
+        const explicit = sessionStorage.getItem('lm_tablet_card_override');
+        return explicit === 'cards' ? false : true;
+      }
+      const saved = localStorage.getItem('lm_card_view_mode');
+      if (saved === 'compact') return true;
+      if (saved === 'cards') return false;
+      return false;
+    } catch {
+      return false;
+    }
+  });
+
+  // Responsive default adjustment: keep short tab as default in tablet and small screen
+  useEffect(() => {
+    const handleCheckScreen = () => {
+      try {
+        if (typeof window !== 'undefined') {
+          const isTabletOrSmall = window.innerWidth <= 1024;
+          const explicit = sessionStorage.getItem('lm_tablet_card_override');
+          if (isTabletOrSmall && !explicit) {
+            setIsCompactView(true);
+          }
+        }
+      } catch {}
+    };
+
+    window.addEventListener('resize', handleCheckScreen);
+    return () => window.removeEventListener('resize', handleCheckScreen);
+  }, []);
+
+  const handleToggleCompactView = (compact: boolean) => {
+    setIsCompactView(compact);
+    try {
+      localStorage.setItem('lm_card_view_mode', compact ? 'compact' : 'cards');
+      if (typeof window !== 'undefined' && window.innerWidth <= 1024) {
+        sessionStorage.setItem('lm_tablet_card_override', compact ? 'compact' : 'cards');
+      }
+    } catch {}
+  };
+
   // Drag and drop reordering state
   const [draggedLinkId, setDraggedLinkId] = useState<string | null>(null);
   const [dragOverLinkId, setDragOverLinkId] = useState<string | null>(null);
   const [draggableCardId, setDraggableCardId] = useState<string | null>(null);
 
-  // User Profile & Custom Subfolder Handle (e.g. josephsoren)
-  const [userUsername, setUserUsername] = useState<string>('josephsoren');
-  const [editUsernameInput, setEditUsernameInput] = useState<string>('josephsoren');
+  // User Profile, Themes & Custom Subfolder Handle (e.g. josephsoren)
+  const [userUsername, setUserUsername] = useState<string>(() => localStorage.getItem('lm_username') || 'josephsoren');
+  const [userDisplayName, setUserDisplayName] = useState<string>(() => localStorage.getItem('lm_display_name') || 'Joseph Soren');
+  const [userPhotoURL, setUserPhotoURL] = useState<string>(() => localStorage.getItem('lm_photo_url') || '');
+  const [userBio, setUserBio] = useState<string>(() => localStorage.getItem('lm_bio') || '');
+  const [userThemeId, setUserThemeId] = useState<ProfileTheme['id']>(() => (localStorage.getItem('lm_theme_id') as ProfileTheme['id']) || 'default');
+  const [userBannerStyle, setUserBannerStyle] = useState<string>(() => localStorage.getItem('lm_banner_style') || 'banner_default');
+  const [userBannerUrl, setUserBannerUrl] = useState<string>(() => localStorage.getItem('lm_banner_url') || '');
+  const [userButtonStyle, setUserButtonStyle] = useState<LinktreeButtonStyle>(
+    () => (localStorage.getItem('lm_button_style') as LinktreeButtonStyle) || 'pill'
+  );
+  const [userDefaultView, setUserDefaultView] = useState<PublicLayoutView>(
+    () => (localStorage.getItem('lm_default_view') as PublicLayoutView) || 'linktree'
+  );
+  const [userVerifiedBadge, setUserVerifiedBadge] = useState<boolean>(
+    () => localStorage.getItem('lm_verified_badge') !== 'false'
+  );
+  const [userSocialLinks, setUserSocialLinks] = useState<SocialLinks>(() => {
+    try {
+      const stored = localStorage.getItem('lm_social_links');
+      return stored ? JSON.parse(stored) : {
+        github: 'https://github.com/josephsoren',
+        twitter: 'https://x.com/josephsoren',
+        linkedin: 'https://linkedin.com/in/josephsoren',
+        email: 'josephsoren217@gmail.com',
+      };
+    } catch {
+      return {};
+    }
+  });
+
+  // Form edit states for Settings
+  const [editUsernameInput, setEditUsernameInput] = useState<string>(userUsername);
+  const [editDisplayNameInput, setEditDisplayNameInput] = useState<string>(userDisplayName);
+  const [editPhotoURLInput, setEditPhotoURLInput] = useState<string>(userPhotoURL);
+  const [editBioInput, setEditBioInput] = useState<string>(userBio);
+  const [editThemeId, setEditThemeId] = useState<ProfileTheme['id']>(userThemeId);
+  const [editBannerStyle, setEditBannerStyle] = useState<string>(userBannerStyle);
+  const [editBannerUrl, setEditBannerUrl] = useState<string>(userBannerUrl);
+  const [editButtonStyle, setEditButtonStyle] = useState<LinktreeButtonStyle>(userButtonStyle);
+  const [editDefaultView, setEditDefaultView] = useState<PublicLayoutView>(userDefaultView);
+  const [editVerifiedBadge, setEditVerifiedBadge] = useState<boolean>(userVerifiedBadge);
+  const [editSocialLinks, setEditSocialLinks] = useState<SocialLinks>(userSocialLinks);
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [isSavingUsername, setIsSavingUsername] = useState(false);
+  const [settingsActiveTab, setSettingsActiveTab] = useState<'appearance' | 'links'>('appearance');
 
   // Public Profile Viewing State (for https://linkmanager.in/{username} & /{username}/{category})
   const [publicProfileUsername, setPublicProfileUsername] = useState<string>('josephsoren');
@@ -200,6 +316,7 @@ export default function App() {
   const [publicProfileLoading, setPublicProfileLoading] = useState(false);
   const [publicCategory, setPublicCategory] = useState<string>('All');
   const [publicSearch, setPublicSearch] = useState<string>('');
+  const [publicViewMode, setPublicViewMode] = useState<PublicLayoutView>('linktree');
 
   // Settings view filters
   const [settingsSearch, setSettingsSearch] = useState<string>('');
@@ -220,6 +337,7 @@ export default function App() {
   const [showCustomUrlInput, setShowCustomUrlInput] = useState(false);
   const [formIsPublic, setFormIsPublic] = useState(false);
   const [formIsFavorite, setFormIsFavorite] = useState(false);
+  const [formIsHighlighted, setFormIsHighlighted] = useState(false);
 
   // Delete Confirmation Modal
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -319,6 +437,8 @@ export default function App() {
               isPublic: Boolean(data.isPublic),
               isFavorite: Boolean(data.isFavorite),
               order: typeof data.order === 'number' ? data.order : undefined,
+              clickCount: typeof data.clickCount === 'number' ? data.clickCount : 0,
+              isHighlighted: Boolean(data.isHighlighted),
             });
           });
 
@@ -340,6 +460,8 @@ export default function App() {
                 isPublic: Boolean(item.isPublic),
                 isFavorite: Boolean(item.isFavorite),
                 order: typeof item.order === 'number' ? item.order : idx,
+                clickCount: typeof item.clickCount === 'number' ? item.clickCount : 0,
+                isHighlighted: Boolean(item.isHighlighted),
               });
             });
             batch.commit().catch(console.error);
@@ -406,12 +528,31 @@ export default function App() {
     }
   }, [links]);
 
-  // Sync user profile, handle, and custom categories on auth change
+  // Sync user profile, handle, themes, and custom categories on auth change
   useEffect(() => {
     if (!currentUser) {
       const storedHandle = localStorage.getItem('lm_username') || 'josephsoren';
+      const storedDisplayName = localStorage.getItem('lm_display_name') || 'Joseph Soren';
+      const storedPhotoURL = localStorage.getItem('lm_photo_url') || '';
+      const storedBio = localStorage.getItem('lm_bio') || '';
+      const storedThemeId = (localStorage.getItem('lm_theme_id') as ProfileTheme['id']) || 'default';
+      const storedBannerStyle = localStorage.getItem('lm_banner_style') || 'banner_default';
+      const storedBannerUrl = localStorage.getItem('lm_banner_url') || '';
+
       setUserUsername(storedHandle);
       setEditUsernameInput(storedHandle);
+      setUserDisplayName(storedDisplayName);
+      setEditDisplayNameInput(storedDisplayName);
+      setUserPhotoURL(storedPhotoURL);
+      setEditPhotoURLInput(storedPhotoURL);
+      setUserBio(storedBio);
+      setEditBioInput(storedBio);
+      setUserThemeId(storedThemeId);
+      setEditThemeId(storedThemeId);
+      setUserBannerStyle(storedBannerStyle);
+      setEditBannerStyle(storedBannerStyle);
+      setUserBannerUrl(storedBannerUrl);
+      setEditBannerUrl(storedBannerUrl);
       return;
     }
 
@@ -419,11 +560,22 @@ export default function App() {
     getDoc(userDocRef)
       .then((snap) => {
         let chosenUsername = '';
+        let chosenDisplayName = currentUser.displayName || '';
+        let chosenPhotoURL = currentUser.photoURL || '';
+        let chosenBio = '';
+        let chosenThemeId: ProfileTheme['id'] = 'default';
+        let chosenBannerStyle = 'banner_default';
+        let chosenBannerUrl = '';
+
         if (snap.exists()) {
           const uData = snap.data();
-          if (uData.username) {
-            chosenUsername = uData.username;
-          }
+          if (uData.username) chosenUsername = uData.username;
+          if (uData.displayName) chosenDisplayName = uData.displayName;
+          if (uData.photoURL) chosenPhotoURL = uData.photoURL;
+          if (uData.bio) chosenBio = uData.bio;
+          if (uData.themeTemplate) chosenThemeId = uData.themeTemplate;
+          if (uData.bannerStyle) chosenBannerStyle = uData.bannerStyle;
+          if (uData.bannerUrl) chosenBannerUrl = uData.bannerUrl;
           if (uData.customCategories && Array.isArray(uData.customCategories)) {
             setCustomCategories(uData.customCategories);
             localStorage.setItem('lm_custom_categories', JSON.stringify(uData.customCategories));
@@ -442,9 +594,13 @@ export default function App() {
             {
               uid: currentUser.uid,
               email: currentUser.email,
-              displayName: currentUser.displayName || chosenUsername,
-              photoURL: currentUser.photoURL || '',
+              displayName: chosenDisplayName || chosenUsername,
+              photoURL: chosenPhotoURL,
               username: chosenUsername,
+              bio: chosenBio,
+              themeTemplate: chosenThemeId,
+              bannerStyle: chosenBannerStyle,
+              bannerUrl: chosenBannerUrl,
               updatedAt: new Date().toISOString(),
             },
             { merge: true }
@@ -455,8 +611,12 @@ export default function App() {
             {
               uid: currentUser.uid,
               username: chosenUsername,
-              displayName: currentUser.displayName || chosenUsername,
-              photoURL: currentUser.photoURL || '',
+              displayName: chosenDisplayName || chosenUsername,
+              photoURL: chosenPhotoURL,
+              bio: chosenBio,
+              themeTemplate: chosenThemeId,
+              bannerStyle: chosenBannerStyle,
+              bannerUrl: chosenBannerUrl,
             },
             { merge: true }
           ).catch(console.error);
@@ -464,7 +624,26 @@ export default function App() {
 
         setUserUsername(chosenUsername);
         setEditUsernameInput(chosenUsername);
+        setUserDisplayName(chosenDisplayName || chosenUsername);
+        setEditDisplayNameInput(chosenDisplayName || chosenUsername);
+        setUserPhotoURL(chosenPhotoURL);
+        setEditPhotoURLInput(chosenPhotoURL);
+        setUserBio(chosenBio);
+        setEditBioInput(chosenBio);
+        setUserThemeId(chosenThemeId);
+        setEditThemeId(chosenThemeId);
+        setUserBannerStyle(chosenBannerStyle);
+        setEditBannerStyle(chosenBannerStyle);
+        setUserBannerUrl(chosenBannerUrl);
+        setEditBannerUrl(chosenBannerUrl);
+
         localStorage.setItem('lm_username', chosenUsername);
+        localStorage.setItem('lm_display_name', chosenDisplayName || chosenUsername);
+        localStorage.setItem('lm_photo_url', chosenPhotoURL);
+        localStorage.setItem('lm_bio', chosenBio);
+        localStorage.setItem('lm_theme_id', chosenThemeId);
+        localStorage.setItem('lm_banner_style', chosenBannerStyle);
+        localStorage.setItem('lm_banner_url', chosenBannerUrl);
       })
       .catch((err) => {
         console.error('Error fetching user profile:', err);
@@ -543,6 +722,14 @@ export default function App() {
         username: targetSlug,
         displayName: targetSlug,
         photoURL: '',
+        bio: '',
+        themeTemplate: 'default',
+        bannerStyle: 'banner_default',
+        bannerUrl: '',
+        buttonStyle: 'pill',
+        defaultView: 'linktree',
+        verifiedBadge: true,
+        socialLinks: {},
       };
 
       if (usernameSnap.exists()) {
@@ -554,19 +741,52 @@ export default function App() {
           photoURL: uData.photoURL || '',
           email: uData.email || '',
           uid: targetUid,
+          bio: uData.bio || '',
+          themeTemplate: uData.themeTemplate || 'default',
+          bannerStyle: uData.bannerStyle || 'banner_default',
+          bannerUrl: uData.bannerUrl || '',
+          buttonStyle: uData.buttonStyle || 'pill',
+          defaultView: uData.defaultView || 'linktree',
+          verifiedBadge: uData.verifiedBadge !== false,
+          socialLinks: uData.socialLinks || {},
         };
       } else if (currentUser && (userUsername === targetSlug || currentUser.uid === targetSlug)) {
         targetUid = currentUser.uid;
         profileData = {
           username: userUsername,
-          displayName: currentUser.displayName || userUsername,
-          photoURL: currentUser.photoURL || '',
+          displayName: userDisplayName || currentUser.displayName || userUsername,
+          photoURL: userPhotoURL || currentUser.photoURL || '',
           email: currentUser.email || '',
           uid: currentUser.uid,
+          bio: userBio || '',
+          themeTemplate: userThemeId || 'default',
+          bannerStyle: userBannerStyle || 'banner_default',
+          bannerUrl: userBannerUrl || '',
+          buttonStyle: userButtonStyle || 'pill',
+          defaultView: userDefaultView || 'linktree',
+          verifiedBadge: userVerifiedBadge,
+          socialLinks: userSocialLinks || {},
+        };
+      } else if (targetSlug === userUsername || targetSlug === 'josephsoren') {
+        profileData = {
+          username: userUsername,
+          displayName: userDisplayName || 'Joseph Soren',
+          photoURL: userPhotoURL || '',
+          email: currentUser?.email || '',
+          uid: currentUser?.uid,
+          bio: userBio || '',
+          themeTemplate: userThemeId || 'default',
+          bannerStyle: userBannerStyle || 'banner_default',
+          bannerUrl: userBannerUrl || '',
+          buttonStyle: userButtonStyle || 'pill',
+          defaultView: userDefaultView || 'linktree',
+          verifiedBadge: userVerifiedBadge,
+          socialLinks: userSocialLinks || {},
         };
       }
 
       setPublicProfileUser(profileData);
+      setPublicViewMode(profileData.defaultView || 'linktree');
 
       let fetchedItems: LinkItem[] = [];
       if (targetUid) {
@@ -589,6 +809,8 @@ export default function App() {
             userId: targetUid,
             isPublic: true,
             isFavorite: Boolean(d.isFavorite),
+            clickCount: typeof d.clickCount === 'number' ? d.clickCount : 0,
+            isHighlighted: Boolean(d.isHighlighted),
           });
         });
         pubItems.sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
@@ -675,11 +897,20 @@ export default function App() {
   const handleSelectPublicCategory = (cat: string) => {
     setPublicCategory(cat);
     const targetUser = publicProfileUsername || userUsername || 'josephsoren';
+    const hasSearchU = new URLSearchParams(window.location.search).has('u');
     if (cat === 'All') {
-      window.history.pushState(null, '', `/${targetUser}`);
+      if (hasSearchU) {
+        window.history.pushState(null, '', `?u=${encodeURIComponent(targetUser)}`);
+      } else {
+        window.history.pushState(null, '', `/${targetUser}`);
+      }
     } else {
       const slug = slugifyCategory(cat);
-      window.history.pushState(null, '', `/${targetUser}/${slug}`);
+      if (hasSearchU) {
+        window.history.pushState(null, '', `?u=${encodeURIComponent(targetUser)}&cat=${encodeURIComponent(slug)}`);
+      } else {
+        window.history.pushState(null, '', `/${targetUser}/${slug}`);
+      }
     }
   };
 
@@ -735,48 +966,198 @@ export default function App() {
     });
   };
 
-  const handleSaveUsername = async () => {
-    const clean = editUsernameInput.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
-    if (!clean) return;
+  // Handle theme template selection: sets theme and default banner for that theme
+  const handleSelectTheme = (themeId: ProfileTheme['id']) => {
+    setEditThemeId(themeId);
+    const theme = getThemeById(themeId);
+    setEditBannerStyle(theme.bannerStyleName);
+  };
+
+  // Handle avatar preset selection
+  const handleSelectPresetAvatar = (avatarSvg: string) => {
+    setEditPhotoURLInput(avatarSvg);
+  };
+
+  // Handle preset banner selection
+  const handleSelectPresetBanner = (bannerId: string) => {
+    setEditBannerStyle(bannerId);
+    setEditBannerUrl(''); // clear uploaded custom banner to use preset
+  };
+
+  // Handle custom photo file upload (converted to base64 data URL)
+  const handleAvatarFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setCopyNotification('Image size should be less than 2MB');
+      setTimeout(() => setCopyNotification(null), 2500);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      if (typeof event.target?.result === 'string') {
+        setEditPhotoURLInput(event.target.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Handle custom banner image upload (converted to base64 data URL)
+  const handleBannerFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 3 * 1024 * 1024) {
+      setCopyNotification('Banner image size should be less than 3MB');
+      setTimeout(() => setCopyNotification(null), 2500);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      if (typeof event.target?.result === 'string') {
+        setEditBannerUrl(event.target.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Full Profile & Theme Customization Save Handler
+  const handleSaveProfileCustomization = async () => {
+    const cleanUsername = editUsernameInput.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
+    if (!cleanUsername) {
+      setCopyNotification('Please provide a valid username handle');
+      setTimeout(() => setCopyNotification(null), 2500);
+      return;
+    }
+    const cleanDisplayName = editDisplayNameInput.trim() || cleanUsername;
+    const cleanBio = editBioInput.trim();
+
+    setIsSavingProfile(true);
     setIsSavingUsername(true);
     try {
       if (currentUser) {
-        const existingDoc = await getDoc(doc(db, 'usernames', clean));
-        if (existingDoc.exists() && existingDoc.data().uid !== currentUser.uid) {
-          setCopyNotification('This username is already taken. Please choose another.');
-          setTimeout(() => setCopyNotification(null), 3000);
-          setIsSavingUsername(false);
-          return;
+        // If username changed, check if available
+        if (cleanUsername !== userUsername) {
+          const existingDoc = await getDoc(doc(db, 'usernames', cleanUsername));
+          if (existingDoc.exists() && existingDoc.data().uid !== currentUser.uid) {
+            setCopyNotification('This handle is already taken. Please choose another.');
+            setTimeout(() => setCopyNotification(null), 3000);
+            setIsSavingProfile(false);
+            setIsSavingUsername(false);
+            return;
+          }
+          // Remove old username record if different
+          if (userUsername && userUsername !== cleanUsername) {
+            try {
+              await deleteDoc(doc(db, 'usernames', userUsername));
+            } catch {}
+          }
         }
 
-        await setDoc(doc(db, 'usernames', clean), {
+        // Update usernames lookup doc
+        await setDoc(doc(db, 'usernames', cleanUsername), {
           uid: currentUser.uid,
-          username: clean,
-          displayName: currentUser.displayName || clean,
-          photoURL: currentUser.photoURL || '',
+          username: cleanUsername,
+          displayName: cleanDisplayName,
+          photoURL: editPhotoURLInput || '',
           email: currentUser.email || '',
+          bio: cleanBio,
+          themeTemplate: editThemeId,
+          bannerStyle: editBannerStyle,
+          bannerUrl: editBannerUrl || '',
+          buttonStyle: editButtonStyle,
+          defaultView: editDefaultView,
+          verifiedBadge: editVerifiedBadge,
+          socialLinks: editSocialLinks,
+          updatedAt: new Date().toISOString(),
         });
 
+        // Update user profile doc
         await setDoc(
           doc(db, 'users', currentUser.uid),
           {
-            username: clean,
+            username: cleanUsername,
+            displayName: cleanDisplayName,
+            photoURL: editPhotoURLInput || '',
+            bio: cleanBio,
+            themeTemplate: editThemeId,
+            bannerStyle: editBannerStyle,
+            bannerUrl: editBannerUrl || '',
+            buttonStyle: editButtonStyle,
+            defaultView: editDefaultView,
+            verifiedBadge: editVerifiedBadge,
+            socialLinks: editSocialLinks,
+            updatedAt: new Date().toISOString(),
           },
           { merge: true }
         );
+
+        // Update Firebase Auth profile if photo is a normal URL or name changed
+        if (currentUser.displayName !== cleanDisplayName) {
+          try {
+            await updateProfile(currentUser, { displayName: cleanDisplayName });
+          } catch {}
+        }
       }
-      setUserUsername(clean);
-      localStorage.setItem('lm_username', clean);
-      setCopyNotification(`Username updated to @${clean}!`);
+
+      // Update local state
+      setUserUsername(cleanUsername);
+      setUserDisplayName(cleanDisplayName);
+      setUserPhotoURL(editPhotoURLInput);
+      setUserBio(cleanBio);
+      setUserThemeId(editThemeId);
+      setUserBannerStyle(editBannerStyle);
+      setUserBannerUrl(editBannerUrl);
+      setUserButtonStyle(editButtonStyle);
+      setUserDefaultView(editDefaultView);
+      setUserVerifiedBadge(editVerifiedBadge);
+      setUserSocialLinks(editSocialLinks);
+
+      // Persist to local storage
+      localStorage.setItem('lm_username', cleanUsername);
+      localStorage.setItem('lm_display_name', cleanDisplayName);
+      localStorage.setItem('lm_photo_url', editPhotoURLInput);
+      localStorage.setItem('lm_bio', cleanBio);
+      localStorage.setItem('lm_theme_id', editThemeId);
+      localStorage.setItem('lm_banner_style', editBannerStyle);
+      localStorage.setItem('lm_banner_url', editBannerUrl);
+      localStorage.setItem('lm_button_style', editButtonStyle);
+      localStorage.setItem('lm_default_view', editDefaultView);
+      localStorage.setItem('lm_verified_badge', String(editVerifiedBadge));
+      localStorage.setItem('lm_social_links', JSON.stringify(editSocialLinks));
+
+      // Also update publicProfileUser in memory if viewing own profile
+      if (publicProfileUsername === cleanUsername || publicProfileUsername === userUsername) {
+        setPublicProfileUsername(cleanUsername);
+        setPublicProfileUser({
+          username: cleanUsername,
+          displayName: cleanDisplayName,
+          photoURL: editPhotoURLInput,
+          email: currentUser?.email || '',
+          uid: currentUser?.uid,
+          bio: cleanBio,
+          themeTemplate: editThemeId,
+          bannerStyle: editBannerStyle,
+          bannerUrl: editBannerUrl,
+          buttonStyle: editButtonStyle,
+          defaultView: editDefaultView,
+          verifiedBadge: editVerifiedBadge,
+          socialLinks: editSocialLinks,
+        });
+      }
+
+      setCopyNotification('Profile & theme settings saved!');
       setTimeout(() => setCopyNotification(null), 2500);
     } catch (err) {
-      console.error('Error updating username:', err);
-      setCopyNotification('Failed to update username');
+      console.error('Error saving profile settings:', err);
+      setCopyNotification('Failed to save profile settings');
       setTimeout(() => setCopyNotification(null), 2500);
     } finally {
+      setIsSavingProfile(false);
       setIsSavingUsername(false);
     }
   };
+
+  const handleSaveUsername = handleSaveProfileCustomization;
 
   const saveLocalLinks = (newLinks: LinkItem[]) => {
     setLinks(newLinks);
@@ -813,6 +1194,7 @@ export default function App() {
     setShowCustomUrlInput(false);
     setFormIsPublic(false);
     setFormIsFavorite(false);
+    setFormIsHighlighted(false);
     setIsAddingCustomCategoryInModal(false);
     setModalNewCategoryText('');
     setIsLinkModalOpen(true);
@@ -829,6 +1211,7 @@ export default function App() {
     setShowCustomUrlInput(false);
     setFormIsPublic(Boolean(link.isPublic));
     setFormIsFavorite(Boolean(link.isFavorite));
+    setFormIsHighlighted(Boolean(link.isHighlighted));
     setIsAddingCustomCategoryInModal(false);
     setModalNewCategoryText('');
     setIsLinkModalOpen(true);
@@ -1023,6 +1406,7 @@ export default function App() {
           thumbnail: formThumbnail.trim() || '',
           isPublic: formIsPublic,
           isFavorite: formIsFavorite,
+          isHighlighted: formIsHighlighted,
         });
       } else {
         const updated = links.map((l) =>
@@ -1036,6 +1420,7 @@ export default function App() {
                 thumbnail: formThumbnail.trim() || undefined,
                 isPublic: formIsPublic,
                 isFavorite: formIsFavorite,
+                isHighlighted: formIsHighlighted,
               }
             : l
         );
@@ -1053,7 +1438,9 @@ export default function App() {
           thumbnail: formThumbnail.trim() || '',
           isPublic: formIsPublic,
           isFavorite: formIsFavorite,
+          isHighlighted: formIsHighlighted,
           order: 0,
+          clickCount: 0,
           createdAt: new Date().toISOString(),
         });
       } else {
@@ -1066,7 +1453,9 @@ export default function App() {
           thumbnail: formThumbnail.trim() || undefined,
           isPublic: formIsPublic,
           isFavorite: formIsFavorite,
+          isHighlighted: formIsHighlighted,
           order: 0,
+          clickCount: 0,
           createdAt: new Date().toISOString(),
         };
         saveLocalLinks([newLink, ...links]);
@@ -1217,6 +1606,46 @@ export default function App() {
     document.body.appendChild(downloadAnchor);
     downloadAnchor.click();
     downloadAnchor.remove();
+  };
+
+  // Track link click and persist clickCount in Firestore
+  const handleTrackLinkClick = async (link: LinkItem) => {
+    if (!link || !link.id) return;
+    const currentCount = link.clickCount || 0;
+    const nextCount = currentCount + 1;
+
+    // Optimistically update link state in publicLinks and links
+    setPublicLinks((prev) =>
+      prev.map((l) => (l.id === link.id ? { ...l, clickCount: nextCount } : l))
+    );
+    setLinks((prev) =>
+      prev.map((l) => (l.id === link.id ? { ...l, clickCount: nextCount } : l))
+    );
+
+    // Persist increment in Firestore
+    const targetUid = link.userId || publicProfileUser?.uid || currentUser?.uid;
+    if (targetUid) {
+      try {
+        const linkRef = doc(db, 'users', targetUid, 'links', link.id);
+        await updateDoc(linkRef, {
+          clickCount: increment(1),
+        });
+      } catch (err) {
+        console.warn('Click count Firestore tracking error:', err);
+      }
+    } else {
+      // Local storage persistence fallback
+      try {
+        const localData = localStorage.getItem('linkmanager_data');
+        if (localData) {
+          const parsed: LinkItem[] = JSON.parse(localData);
+          const updated = parsed.map((l) =>
+            l.id === link.id ? { ...l, clickCount: nextCount } : l
+          );
+          localStorage.setItem('linkmanager_data', JSON.stringify(updated));
+        }
+      } catch {}
+    }
   };
 
   // Export PDF
@@ -1569,6 +1998,60 @@ export default function App() {
   const hasPublicFavorites = useMemo(() => {
     return publicLinks.some((l) => l.isFavorite);
   }, [publicLinks]);
+
+  // Social Links Bar Renderer
+  const renderSocialLinksBar = (socials?: SocialLinks, idPrefix: string = 'socialBar') => {
+    if (!socials) return null;
+    const items: { key: keyof SocialLinks; icon: string; title: string; class: string; prefix?: string }[] = [
+      { key: 'instagram', icon: 'fa-brands fa-instagram', title: 'Instagram', class: 'social-instagram', prefix: 'https://instagram.com/' },
+      { key: 'twitter', icon: 'fa-brands fa-x-twitter', title: 'X (Twitter)', class: 'social-x', prefix: 'https://x.com/' },
+      { key: 'youtube', icon: 'fa-brands fa-youtube', title: 'YouTube', class: 'social-youtube', prefix: 'https://youtube.com/' },
+      { key: 'github', icon: 'fa-brands fa-github', title: 'GitHub', class: 'social-github', prefix: 'https://github.com/' },
+      { key: 'linkedin', icon: 'fa-brands fa-linkedin-in', title: 'LinkedIn', class: 'social-linkedin', prefix: 'https://linkedin.com/in/' },
+      { key: 'tiktok', icon: 'fa-brands fa-tiktok', title: 'TikTok', class: 'social-tiktok', prefix: 'https://tiktok.com/@' },
+      { key: 'spotify', icon: 'fa-brands fa-spotify', title: 'Spotify', class: 'social-spotify', prefix: 'https://open.spotify.com/' },
+      { key: 'discord', icon: 'fa-brands fa-discord', title: 'Discord', class: 'social-discord', prefix: 'https://discord.gg/' },
+      { key: 'twitch', icon: 'fa-brands fa-twitch', title: 'Twitch', class: 'social-twitch', prefix: 'https://twitch.tv/' },
+      { key: 'email', icon: 'fa-solid fa-envelope', title: 'Email', class: 'social-email', prefix: 'mailto:' },
+      { key: 'whatsapp', icon: 'fa-brands fa-whatsapp', title: 'WhatsApp', class: 'social-whatsapp', prefix: 'https://wa.me/' },
+      { key: 'website', icon: 'fa-solid fa-globe', title: 'Website', class: 'social-website' },
+    ];
+
+    const activeItems = items.filter((item) => socials[item.key] && socials[item.key]!.trim());
+    if (activeItems.length === 0) return null;
+
+    return (
+      <div className="linktree-social-bar" id={`${idPrefix}_container`}>
+        {activeItems.map((item) => {
+          const val = socials[item.key]!.trim();
+          let targetUrl = val;
+          if (item.key === 'email') {
+            targetUrl = val.startsWith('mailto:') ? val : `mailto:${val}`;
+          } else if (item.prefix && !val.startsWith('http://') && !val.startsWith('https://')) {
+            const cleanHandle = val.replace(/^@/, '');
+            targetUrl = `${item.prefix}${cleanHandle}`;
+          } else if (!val.startsWith('http://') && !val.startsWith('https://')) {
+            targetUrl = `https://${val}`;
+          }
+
+          return (
+            <a
+              key={item.key}
+              href={targetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`social-icon-btn ${item.class}`}
+              title={item.title}
+              aria-label={item.title}
+              id={`${idPrefix}_${item.key}`}
+            >
+              <i className={item.icon}></i>
+            </a>
+          );
+        })}
+      </div>
+    );
+  };
 
   return (
     <>
@@ -2050,6 +2533,30 @@ export default function App() {
                 </div>
               </div>
               <div className="header-actions-row" style={{ display: 'flex', gap: '8px', alignItems: 'center', position: 'relative' }}>
+                {/* View Mode Toggle: Cards vs Short Tab */}
+                <div className="view-mode-pill-toggle" id="viewModePillToggle">
+                  <button
+                    type="button"
+                    id="toggleCardsViewBtn"
+                    className={`view-mode-btn ${!isCompactView ? 'active' : ''}`}
+                    onClick={() => handleToggleCompactView(false)}
+                    title="Standard Cards view"
+                  >
+                    <i className="fa-solid fa-table-cells-large"></i>
+                    <span className="view-mode-label">Cards</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="toggleCompactViewBtn"
+                    className={`view-mode-btn ${isCompactView ? 'active' : ''}`}
+                    onClick={() => handleToggleCompactView(true)}
+                    title="Short Tab view (Icon, Title, Copy & Open in one line)"
+                  >
+                    <i className="fa-solid fa-bars"></i>
+                    <span className="view-mode-label">Short Tab</span>
+                  </button>
+                </div>
+
                 <button
                   id="shareCurrentCategoryBtn"
                   className="btn btn-secondary"
@@ -2172,10 +2679,93 @@ export default function App() {
             </div>
 
             {/* Link Cards Grid Container (Drag and Drop Reordering, Favorite Pinned, Only Copy & Open Link icon) */}
-            <div className="links-grid" id="linksGrid">
+            <div className={`links-grid ${isCompactView ? 'compact-mode' : ''}`} id="linksGrid">
               {filteredLinks.map((link) => {
                 const domain = getDomain(link.url);
                 const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+                if (isCompactView) {
+                  return (
+                    <div
+                      className={`card card-compact ${link.isFavorite ? 'is-favorite' : ''} ${draggedLinkId === link.id ? 'is-dragging' : ''} ${dragOverLinkId === link.id ? 'drag-over' : ''}`}
+                      key={link.id}
+                      id={`card-${link.id}`}
+                      draggable={draggableCardId === link.id}
+                      onDragStart={(e) => handleDragStart(e, link.id)}
+                      onDragOver={(e) => handleDragOver(e, link.id)}
+                      onDragLeave={(e) => handleDragLeave(e, link.id)}
+                      onDrop={(e) => handleDrop(e, link.id)}
+                      onDragEnd={handleDragEnd}
+                    >
+                      {/* Left: Icon + Title & Domain */}
+                      <div className="card-compact-left">
+                        <img
+                          src={faviconUrl}
+                          className="favicon compact-favicon"
+                          alt="Icon"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src =
+                              'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                          }}
+                        />
+                          <div className="card-compact-title-area">
+                            <a
+                              href={link.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="card-title-link"
+                              id={`cardTitleLink-${link.id}`}
+                              title={`Open ${link.title}`}
+                            >
+                              <h4 className="compact-title">{link.title}</h4>
+                            </a>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                              <span className="domain-tag compact-domain">{domain}</span>
+                              {link.isHighlighted && (
+                                <span className="spotlight-badge compact" title="Linktree Spotlight Featured">
+                                  <i className="fa-solid fa-bolt"></i> Spotlight
+                                </span>
+                              )}
+                              {link.isPublic && (
+                                <span
+                                  className="click-count-badge compact"
+                                  id={`dashboardCompactClickBadge-${link.id}`}
+                                  title={`${(link.clickCount || 0).toLocaleString()} public ${(link.clickCount || 0) === 1 ? 'click' : 'clicks'}`}
+                                >
+                                  <i className="fa-solid fa-arrow-pointer"></i>
+                                  <span>{(link.clickCount || 0).toLocaleString()}</span>
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                      </div>
+
+                      {/* Right: Only Copy and Open Link Icon in one line */}
+                      <div className="card-compact-actions">
+                        <button
+                          id={`copyBtn-${link.id}`}
+                          onClick={() => copyToClipboard(link.url)}
+                          title="Copy URL"
+                          className="compact-action-btn"
+                          aria-label="Copy URL"
+                        >
+                          <i className="fa-regular fa-copy"></i>
+                        </button>
+                        <a
+                          id={`openBtn-${link.id}`}
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open Link in New Tab"
+                          className="compact-action-btn"
+                          aria-label="Open Link"
+                        >
+                          <i className="fa-solid fa-arrow-up-right-from-square"></i>
+                        </a>
+                      </div>
+                    </div>
+                  );
+                }
 
                 return (
                   <div
@@ -2249,6 +2839,11 @@ export default function App() {
                     <div className="card-footer">
                       <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
                         <span className="badge">{link.category}</span>
+                        {link.isHighlighted && (
+                          <span className="spotlight-badge" title="Linktree Spotlight Featured Link">
+                            <i className="fa-solid fa-bolt"></i> Spotlight
+                          </span>
+                        )}
                         {link.isPublic && (
                           <span
                             className="badge"
@@ -2264,6 +2859,16 @@ export default function App() {
                             title="This link is public and visible on your public page"
                           >
                             <i className="fa-solid fa-globe" style={{ fontSize: '0.65rem' }}></i> Public
+                          </span>
+                        )}
+                        {link.isPublic && (
+                          <span
+                            className="click-count-badge"
+                            id={`dashboardClickCountBadge-${link.id}`}
+                            title={`${(link.clickCount || 0).toLocaleString()} total public ${(link.clickCount || 0) === 1 ? 'click' : 'clicks'}`}
+                          >
+                            <i className="fa-solid fa-arrow-pointer"></i>
+                            <span>{(link.clickCount || 0).toLocaleString()} {(link.clickCount || 0) === 1 ? 'click' : 'clicks'}</span>
                           </span>
                         )}
                       </div>
@@ -2321,13 +2926,803 @@ export default function App() {
               <i className="fa-solid fa-arrow-left"></i> Back to Dashboard
             </button>
             <div>
-              <h2 style={{ fontSize: '1.35rem', margin: 0, fontWeight: 700 }}>Link Settings & Management</h2>
+              <h2 style={{ fontSize: '1.35rem', margin: 0, fontWeight: 700 }}>Settings & Customization</h2>
               <span className="subtitle">
-                Configure your public handle, toggle public/private visibility, and edit bookmark details
+                Customize your profile theme, banner & handle, or manage bookmark visibility
               </span>
             </div>
           </div>
 
+          {/* Sub-Navigation Tabs */}
+          <div className="settings-subnav-tabs" id="settingsSubnavTabs">
+            <button
+              id="settingsTabProfileBtn"
+              className={`settings-subnav-btn ${settingsActiveTab === 'appearance' ? 'active' : ''}`}
+              onClick={() => setSettingsActiveTab('appearance')}
+            >
+              <i className="fa-solid fa-wand-magic-sparkles"></i>
+              <span>Profile & Custom Themes</span>
+            </button>
+            <button
+              id="settingsTabLinksBtn"
+              className={`settings-subnav-btn ${settingsActiveTab === 'links' ? 'active' : ''}`}
+              onClick={() => setSettingsActiveTab('links')}
+            >
+              <i className="fa-solid fa-sliders"></i>
+              <span>Links & Privacy Management</span>
+            </button>
+          </div>
+
+          {/* TAB 1: Profile Customization & Themes */}
+          {settingsActiveTab === 'appearance' && (
+            <div className="settings-appearance-grid" id="settingsAppearanceGrid">
+              {/* Left Column: Live Sticky Profile Card Preview */}
+              <div className="settings-preview-col" id="settingsPreviewCol">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                  <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    <i className="fa-solid fa-eye" style={{ marginRight: '6px', color: 'var(--primary-color)' }}></i>
+                    Live Card Preview
+                  </span>
+                  <span className="badge" style={{ fontSize: '0.72rem', backgroundColor: 'rgba(16, 185, 129, 0.12)', color: '#10b981' }}>
+                    Real-time
+                  </span>
+                </div>
+
+                {/* Render the Themed Hero Card Live */}
+                {(() => {
+                  const previewTheme = getThemeById(editThemeId);
+                  const bannerImage = editBannerUrl || getBannerSvg(editBannerStyle, editThemeId);
+
+                  return (
+                    <div
+                      className="profile-themed-hero"
+                      id="settingsLiveHeroPreview"
+                      style={{
+                        backgroundColor: previewTheme.heroBg.startsWith('linear') ? undefined : previewTheme.heroBg,
+                        backgroundImage: previewTheme.heroBg.startsWith('linear') ? previewTheme.heroBg : undefined,
+                        borderColor: previewTheme.heroBorder,
+                      }}
+                    >
+                      {/* Banner Graphic */}
+                      <div className="profile-hero-banner-container">
+                        <img
+                          src={bannerImage}
+                          alt="Banner Preview"
+                          className="profile-hero-banner-image"
+                        />
+                        <div
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            background: 'linear-gradient(to bottom, rgba(0,0,0,0) 60%, rgba(0,0,0,0.4) 100%)',
+                            pointerEvents: 'none',
+                          }}
+                        />
+                      </div>
+
+                      {/* Profile Body */}
+                      <div className="profile-hero-body">
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '14px', flexWrap: 'wrap' }}>
+                          <div className="profile-hero-avatar-wrapper">
+                            {editPhotoURLInput ? (
+                              <img
+                                src={editPhotoURLInput}
+                                alt="Avatar preview"
+                                className="profile-hero-avatar"
+                                style={{ borderColor: previewTheme.heroBorder }}
+                              />
+                            ) : (
+                              <div
+                                className="profile-hero-avatar"
+                                style={{
+                                  backgroundColor: previewTheme.accentColor,
+                                  borderColor: previewTheme.heroBorder,
+                                }}
+                              >
+                                {(editDisplayNameInput || editUsernameInput || 'U')[0].toUpperCase()}
+                              </div>
+                            )}
+                          </div>
+
+                          <div style={{ paddingTop: '4px', flex: 1 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                              <h3 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                                {editDisplayNameInput || editUsernameInput || 'Your Name'}
+                                {editVerifiedBadge && (
+                                  <i
+                                    className="fa-solid fa-circle-check"
+                                    style={{ color: '#3b82f6', fontSize: '1rem' }}
+                                    title="Verified Creator Badge"
+                                  ></i>
+                                )}
+                              </h3>
+                              <span
+                                className="badge"
+                                style={{
+                                  backgroundColor: previewTheme.badgeBg,
+                                  color: previewTheme.badgeColor,
+                                  borderColor: previewTheme.heroBorder,
+                                  fontSize: '0.74rem',
+                                  fontWeight: 600,
+                                }}
+                              >
+                                {previewTheme.id === 'flowerish' && <i className="fa-solid fa-heart" style={{ marginRight: '4px' }}></i>}
+                                {previewTheme.id === 'tech' && <i className="fa-solid fa-terminal" style={{ marginRight: '4px' }}></i>}
+                                {previewTheme.id === 'sunset' && <i className="fa-solid fa-sun" style={{ marginRight: '4px' }}></i>}
+                                {previewTheme.id === 'emerald' && <i className="fa-solid fa-leaf" style={{ marginRight: '4px' }}></i>}
+                                {previewTheme.id === 'darkluxury' && <i className="fa-solid fa-crown" style={{ marginRight: '4px' }}></i>}
+                                {previewTheme.id === 'default' && <i className="fa-solid fa-globe" style={{ marginRight: '4px' }}></i>}
+                                {previewTheme.name}
+                              </span>
+                            </div>
+
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '3px', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                              <span style={{ fontWeight: 600, color: previewTheme.accentColor }}>
+                                @{editUsernameInput || 'username'}
+                              </span>
+                              <span>•</span>
+                              <span>{links.filter((l) => l.isPublic).length} public links</span>
+                            </div>
+
+                            {editBioInput ? (
+                              <p className="profile-bio-text" style={{ fontStyle: 'italic', marginTop: '6px', fontSize: '0.86rem' }}>
+                                "{editBioInput}"
+                              </p>
+                            ) : (
+                              <p className="profile-bio-text" style={{ fontStyle: 'italic', marginTop: '6px', fontSize: '0.84rem', opacity: 0.6 }}>
+                                "No bio added yet. Write a friendly tagline below!"
+                              </p>
+                            )}
+
+                            {/* Live Social Profiles Bar Preview */}
+                            {renderSocialLinksBar(editSocialLinks, 'previewSocial')}
+
+                            <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                              <button
+                                type="button"
+                                className="btn btn-primary"
+                                style={{
+                                  fontSize: '0.78rem',
+                                  padding: '4px 10px',
+                                  backgroundColor: previewTheme.accentColor,
+                                  borderColor: previewTheme.accentColor,
+                                }}
+                              >
+                                <i className="fa-solid fa-share-nodes"></i> Share
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-secondary"
+                                style={{ fontSize: '0.78rem', padding: '4px 10px' }}
+                              >
+                                <i className="fa-solid fa-qrcode" style={{ color: previewTheme.accentColor }}></i> QR
+                              </button>
+                            </div>
+
+                            {/* Live Linktree Button Preview */}
+                            <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid rgba(0,0,0,0.08)' }}>
+                              <span style={{ display: 'block', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)', marginBottom: '8px', fontWeight: 600 }}>
+                                Linktree Button Preview ({editButtonStyle})
+                              </span>
+                              <div className={`linktree-btn style-${editButtonStyle}`} style={{ pointerEvents: 'none', padding: '10px 14px' }}>
+                                <div className="linktree-btn-left">
+                                  <div className="linktree-btn-icon-wrapper" style={{ width: '30px', height: '30px' }}>
+                                    <i className="fa-solid fa-bolt" style={{ color: previewTheme.accentColor }}></i>
+                                  </div>
+                                  <div className="linktree-btn-content">
+                                    <span className="linktree-btn-title" style={{ fontSize: '0.9rem' }}>Featured Project / Portfolio</span>
+                                    <span className="linktree-btn-subtitle" style={{ fontSize: '0.75rem' }}>myportfolio.dev</span>
+                                  </div>
+                                </div>
+                                <span className="linktree-btn-arrow"><i className="fa-solid fa-arrow-up-right-from-square"></i></span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Quick Action bar underneath live preview */}
+                <div style={{ marginTop: '16px', display: 'flex', gap: '8px' }}>
+                  <button
+                    id="previewViewLiveBtn"
+                    className="btn btn-secondary"
+                    style={{ flex: 1, fontSize: '0.85rem' }}
+                    onClick={() => handleNavigateToPublicProfile(userUsername)}
+                  >
+                    <i className="fa-solid fa-arrow-up-right-from-square"></i> Open Public Page
+                  </button>
+                  <button
+                    id="previewCopyLinkBtn"
+                    className="btn btn-secondary"
+                    style={{ fontSize: '0.85rem' }}
+                    onClick={() => handleCopyProfileUrl(userUsername)}
+                    title="Copy public link"
+                  >
+                    <i className="fa-regular fa-copy"></i>
+                  </button>
+                </div>
+              </div>
+
+              {/* Right Column: Customization Controls */}
+              <div className="settings-controls-col" id="settingsControlsCol">
+                {/* 1. Identity & Handle */}
+                <div className="settings-profile-card" id="identitySettingsCard">
+                  <h3 style={{ fontSize: '1.05rem', margin: '0 0 4px 0', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <i className="fa-solid fa-user-pen" style={{ color: 'var(--primary-color)' }}></i>
+                    Profile Identity & Bio
+                  </h3>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', margin: '0 0 16px 0' }}>
+                    Personalize your public display name, handle, avatar photo, and bio intro.
+                  </p>
+
+                  {/* Avatar Picker & Upload */}
+                  <div style={{ marginBottom: '16px' }}>
+                    <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '8px', textTransform: 'uppercase' }}>
+                      Profile Photo / Avatar
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
+                      <div className="profile-hero-avatar-wrapper" style={{ margin: 0 }}>
+                        {editPhotoURLInput ? (
+                          <img
+                            src={editPhotoURLInput}
+                            alt="Current avatar"
+                            className="profile-hero-avatar"
+                            style={{ width: '64px', height: '64px', borderWidth: '2px' }}
+                          />
+                        ) : (
+                          <div
+                            className="profile-hero-avatar"
+                            style={{ width: '64px', height: '64px', fontSize: '1.4rem', borderWidth: '2px' }}
+                          >
+                            {(editDisplayNameInput || editUsernameInput || 'U')[0].toUpperCase()}
+                          </div>
+                        )}
+                      </div>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', flex: 1, minWidth: '220px' }}>
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          <label
+                            htmlFor="avatarFileInput"
+                            className="btn btn-secondary"
+                            style={{ fontSize: '0.82rem', padding: '6px 12px', cursor: 'pointer', margin: 0 }}
+                          >
+                            <i className="fa-solid fa-cloud-arrow-up"></i> Upload Photo
+                            <input
+                              id="avatarFileInput"
+                              type="file"
+                              accept="image/*"
+                              style={{ display: 'none' }}
+                              onChange={handleAvatarFileUpload}
+                            />
+                          </label>
+
+                          {editPhotoURLInput && (
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ fontSize: '0.82rem', padding: '6px 12px', color: '#ef4444' }}
+                              onClick={() => setEditPhotoURLInput('')}
+                            >
+                              <i className="fa-solid fa-trash-can"></i> Remove
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Preset Avatars Row */}
+                        <div style={{ marginTop: '4px' }}>
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block', marginBottom: '4px' }}>
+                            Or choose a preset avatar:
+                          </span>
+                          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                            {PRESET_AVATARS.map((p) => {
+                              const isSelected = editPhotoURLInput === p.url;
+                              return (
+                                <button
+                                  key={p.id}
+                                  type="button"
+                                  id={`presetAvatar_${p.id}`}
+                                  className={`avatar-preset-btn ${isSelected ? 'active' : ''}`}
+                                  onClick={() => handleSelectPresetAvatar(p.url)}
+                                  title={p.name}
+                                  style={{
+                                    border: isSelected ? '2px solid var(--primary-color)' : '1px solid var(--border-color)',
+                                    borderRadius: '50%',
+                                    padding: '2px',
+                                    background: 'none',
+                                    cursor: 'pointer',
+                                    display: 'inline-flex',
+                                  }}
+                                >
+                                  <img
+                                    src={p.url}
+                                    alt={p.name}
+                                    style={{ width: '34px', height: '34px', borderRadius: '50%' }}
+                                  />
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Display Name and Handle inputs */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '14px', marginBottom: '14px' }}>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '4px', textTransform: 'uppercase' }}>
+                        Display Name
+                      </label>
+                      <input
+                        type="text"
+                        id="profileDisplayNameInput"
+                        className="form-control"
+                        value={editDisplayNameInput}
+                        onChange={(e) => setEditDisplayNameInput(e.target.value)}
+                        placeholder="e.g. Rohit Kumar or Sakura Gamer 🌸"
+                        maxLength={50}
+                      />
+                    </div>
+
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '4px', textTransform: 'uppercase' }}>
+                        Public Handle / Subfolder
+                      </label>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ color: 'var(--primary-color)', fontWeight: 600, fontSize: '0.88rem', whiteSpace: 'nowrap' }}>
+                          linkmanager.in/
+                        </span>
+                        <input
+                          type="text"
+                          id="profileUsernameInput"
+                          className="form-control"
+                          value={editUsernameInput}
+                          onChange={(e) => setEditUsernameInput(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+                          placeholder="username"
+                          maxLength={30}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Bio / Tagline */}
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                      <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase' }}>
+                        Bio / Profile Tagline
+                      </label>
+                      <span style={{ fontSize: '0.75rem', color: editBioInput.length >= 180 ? '#ef4444' : 'var(--text-secondary)' }}>
+                        {editBioInput.length}/200
+                      </span>
+                    </div>
+                    <textarea
+                      id="profileBioInput"
+                      className="form-control"
+                      rows={2}
+                      value={editBioInput}
+                      onChange={(e) => setEditBioInput(e.target.value)}
+                      placeholder="e.g. Cozy girl gamer & streamer 🌸 | Sharing my desk setup, mechanical keyboards & favorite games"
+                      maxLength={200}
+                    />
+                  </div>
+                </div>
+
+                {/* 2. Aesthetic Templates & Themes */}
+                <div className="settings-profile-card" id="themesSettingsCard">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '8px', marginBottom: '12px' }}>
+                    <div>
+                      <h3 style={{ fontSize: '1.05rem', margin: '0 0 4px 0', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <i className="fa-solid fa-wand-magic-sparkles" style={{ color: 'var(--primary-color)' }}></i>
+                        Custom Themes & Templates
+                      </h3>
+                      <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', margin: 0 }}>
+                        Select a curated aesthetic template for your link profile card:
+                      </p>
+                    </div>
+                    <span className="badge" style={{ backgroundColor: 'rgba(99, 102, 241, 0.12)', color: 'var(--primary-color)' }}>
+                      6 Aesthetic Styles
+                    </span>
+                  </div>
+
+                  {/* Themes Grid */}
+                  <div className="theme-selector-grid" id="themeSelectorGrid">
+                    {THEME_LIST.map((theme) => {
+                      const isSelected = editThemeId === theme.id;
+                      const bannerThumb = getBannerSvg(theme.bannerStyleName, theme.id);
+
+                      return (
+                        <div
+                          key={theme.id}
+                          id={`themeCard_${theme.id}`}
+                          className={`theme-card-option ${isSelected ? 'active' : ''}`}
+                          onClick={() => handleSelectTheme(theme.id)}
+                          style={{
+                            borderColor: isSelected ? theme.accentColor : undefined,
+                            boxShadow: isSelected ? `0 0 0 2px ${theme.accentColor}40` : undefined,
+                          }}
+                        >
+                          {/* Mini banner preview */}
+                          <div
+                            style={{
+                              height: '48px',
+                              backgroundImage: `url("${bannerThumb}")`,
+                              backgroundSize: 'cover',
+                              backgroundPosition: 'center',
+                              position: 'relative',
+                            }}
+                          >
+                            {isSelected && (
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  top: '6px',
+                                  right: '6px',
+                                  width: '20px',
+                                  height: '20px',
+                                  borderRadius: '50%',
+                                  backgroundColor: theme.accentColor,
+                                  color: '#fff',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  fontSize: '0.65rem',
+                                }}
+                              >
+                                <i className="fa-solid fa-check"></i>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Theme info */}
+                          <div style={{ padding: '10px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span style={{ fontSize: '1rem' }}>
+                                {theme.id === 'flowerish' && '🌸'}
+                                {theme.id === 'tech' && '⚡'}
+                                {theme.id === 'sunset' && '🌅'}
+                                {theme.id === 'emerald' && '🌿'}
+                                {theme.id === 'darkluxury' && '✨'}
+                                {theme.id === 'default' && '🔹'}
+                              </span>
+                              <strong style={{ fontSize: '0.9rem', color: isSelected ? theme.accentColor : 'var(--text-primary)' }}>
+                                {theme.name}
+                              </strong>
+                            </div>
+                            <span style={{ fontSize: '0.72rem', color: theme.accentColor, fontWeight: 600, display: 'block', marginTop: '2px' }}>
+                              {theme.categoryTag}
+                            </span>
+                            <p style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', margin: '4px 0 0 0', lineHeight: 1.3 }}>
+                              {theme.tagline}
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 3. Card Banner Customization */}
+                <div className="settings-profile-card" id="bannerSettingsCard">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '8px', marginBottom: '12px' }}>
+                    <div>
+                      <h3 style={{ fontSize: '1.05rem', margin: '0 0 4px 0', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <i className="fa-solid fa-panorama" style={{ color: 'var(--primary-color)' }}></i>
+                        Card Header Banner Style
+                      </h3>
+                      <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', margin: 0 }}>
+                        Switch between artistic pattern banners or upload your own custom banner graphic.
+                      </p>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <label
+                        htmlFor="bannerFileInput"
+                        className="btn btn-secondary"
+                        style={{ fontSize: '0.82rem', padding: '5px 12px', cursor: 'pointer', margin: 0 }}
+                      >
+                        <i className="fa-solid fa-cloud-arrow-up"></i> Upload Custom Banner
+                        <input
+                          id="bannerFileInput"
+                          type="file"
+                          accept="image/*"
+                          style={{ display: 'none' }}
+                          onChange={handleBannerFileUpload}
+                        />
+                      </label>
+                      {editBannerUrl && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.82rem', padding: '5px 12px', color: '#ef4444' }}
+                          onClick={() => setEditBannerUrl('')}
+                        >
+                          <i className="fa-solid fa-rotate-left"></i> Use Preset
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Preset Banners Grid */}
+                  <div className="banner-presets-grid" id="bannerPresetsGrid">
+                    {PRESET_BANNERS.map((b) => {
+                      const isSelected = !editBannerUrl && editBannerStyle === b.id;
+                      return (
+                        <div
+                          key={b.id}
+                          id={`presetBanner_${b.id}`}
+                          className={`banner-preset-card ${isSelected ? 'active' : ''}`}
+                          onClick={() => handleSelectPresetBanner(b.id)}
+                          style={{
+                            border: isSelected ? '2px solid var(--primary-color)' : '1px solid var(--border-color)',
+                            borderRadius: '8px',
+                            overflow: 'hidden',
+                            cursor: 'pointer',
+                            position: 'relative',
+                            transition: 'all 0.2s ease',
+                          }}
+                        >
+                          <img
+                            src={b.svg}
+                            alt={b.name}
+                            style={{ width: '100%', height: '56px', objectFit: 'cover', display: 'block' }}
+                          />
+                          <div style={{ padding: '6px 8px', fontSize: '0.78rem', fontWeight: 600, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span>{b.name}</span>
+                            {isSelected && (
+                              <span style={{ color: 'var(--primary-color)', fontSize: '0.75rem' }}>
+                                <i className="fa-solid fa-circle-check"></i>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 4. Linktree Bio Buttons & Layout */}
+                <div
+                  id="linktreeButtonSettingsCard"
+                  style={{
+                    backgroundColor: 'var(--bg-card)',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '12px',
+                    padding: '20px',
+                    boxShadow: 'var(--shadow-sm)',
+                  }}
+                >
+                  <div style={{ marginBottom: '16px' }}>
+                    <h3 style={{ fontSize: '1.05rem', margin: '0 0 4px 0', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <i className="fa-solid fa-shapes" style={{ color: 'var(--primary-color)' }}></i>
+                      Linktree Button Style & Layout
+                    </h3>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', margin: 0 }}>
+                      Choose your button silhouette, default public view, and verified creator status.
+                    </p>
+                  </div>
+
+                  {/* Button Shape Selector */}
+                  <div style={{ marginBottom: '20px' }}>
+                    <label style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '8px' }}>
+                      Button Shape Style
+                    </label>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '10px' }} id="buttonStylePicker">
+                      {[
+                        { id: 'pill', name: 'Capsule Pill', desc: 'Rounded pill shape', icon: 'fa-regular fa-circle-dot' },
+                        { id: 'rounded', name: 'Soft Rounded', desc: '14px rounded corners', icon: 'fa-regular fa-square' },
+                        { id: 'hard', name: 'Sharp Modern', desc: 'Crisp minimal edges', icon: 'fa-regular fa-square-full' },
+                        { id: 'outline', name: 'Glass Outline', desc: 'Transparent & border', icon: 'fa-regular fa-window-maximize' },
+                        { id: 'shadow', name: 'Soft Float', desc: 'Elevated soft shadow', icon: 'fa-solid fa-layer-group' },
+                      ].map((styleOption) => {
+                        const isSelected = editButtonStyle === styleOption.id;
+                        return (
+                          <div
+                            key={styleOption.id}
+                            id={`btnStyleOption_${styleOption.id}`}
+                            className={`banner-preset-card ${isSelected ? 'active' : ''}`}
+                            onClick={() => setEditButtonStyle(styleOption.id as any)}
+                            style={{
+                              border: isSelected ? '2px solid var(--primary-color)' : '1px solid var(--border-color)',
+                              borderRadius: '10px',
+                              padding: '12px 10px',
+                              cursor: 'pointer',
+                              textAlign: 'center',
+                              backgroundColor: isSelected ? 'var(--bg-tertiary)' : 'var(--bg-secondary)',
+                              transition: 'all 0.15s ease',
+                            }}
+                          >
+                            <i className={styleOption.icon} style={{ fontSize: '1.2rem', color: isSelected ? 'var(--primary-color)' : 'var(--text-secondary)', marginBottom: '6px' }}></i>
+                            <div style={{ fontWeight: 600, fontSize: '0.82rem', color: 'var(--text-primary)' }}>{styleOption.name}</div>
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '2px' }}>{styleOption.desc}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Default Public View & Verified Badge */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px', paddingTop: '12px', borderTop: '1px solid var(--border-color)' }}>
+                    <div>
+                      <label htmlFor="defaultPublicViewSelect" style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '6px' }}>
+                        Default Public Page View
+                      </label>
+                      <select
+                        id="defaultPublicViewSelect"
+                        value={editDefaultView}
+                        onChange={(e) => setEditDefaultView(e.target.value as any)}
+                        style={{
+                          width: '100%',
+                          padding: '8px 12px',
+                          borderRadius: '8px',
+                          border: '1px solid var(--border-color)',
+                          backgroundColor: 'var(--bg-secondary)',
+                          color: 'var(--text-primary)',
+                          fontSize: '0.88rem',
+                        }}
+                      >
+                        <option value="linktree">Linktree Bio Stack (Full-width centered vertical stack)</option>
+                        <option value="compact">Short Tab Mode (Compact horizontal rows)</option>
+                        <option value="cards">Rich Cards Grid (Two-column card grid)</option>
+                      </select>
+                      <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', margin: '4px 0 0 0' }}>
+                        How visitors will first see your profile before they toggle views.
+                      </p>
+                    </div>
+
+                    <div>
+                      <div className="public-switch-bar" style={{ margin: 0, padding: '10px 12px', border: '1px solid var(--border-color)', borderRadius: '8px' }}>
+                        <div className="switch-label">
+                          <span className="title" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <i className="fa-solid fa-circle-check" style={{ color: '#3b82f6' }}></i> Verified Creator Badge
+                          </span>
+                          <span className="desc">Display a verified blue checkmark on your public page</span>
+                        </div>
+                        <label className="toggle-switch" htmlFor="editVerifiedBadgeToggle">
+                          <input
+                            type="checkbox"
+                            id="editVerifiedBadgeToggle"
+                            checked={editVerifiedBadge}
+                            onChange={(e) => setEditVerifiedBadge(e.target.checked)}
+                          />
+                          <span className="toggle-slider"></span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 5. Social Media Channels Bar */}
+                <div
+                  id="socialLinksSettingsCard"
+                  style={{
+                    backgroundColor: 'var(--bg-card)',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '12px',
+                    padding: '20px',
+                    boxShadow: 'var(--shadow-sm)',
+                  }}
+                >
+                  <div style={{ marginBottom: '16px' }}>
+                    <h3 style={{ fontSize: '1.05rem', margin: '0 0 4px 0', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <i className="fa-solid fa-share-nodes" style={{ color: 'var(--primary-color)' }}></i>
+                      Social Media Header Bar
+                    </h3>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', margin: 0 }}>
+                      Connect your social media handles and profiles. These will be prominently displayed directly under your bio on your Linktree page.
+                    </p>
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '14px' }}>
+                    {[
+                      { key: 'instagram', label: 'Instagram', icon: 'fa-brands fa-instagram', color: '#e1306c', placeholder: '@username or url' },
+                      { key: 'twitter', label: 'X (Twitter)', icon: 'fa-brands fa-x-twitter', color: '#1da1f2', placeholder: '@handle or url' },
+                      { key: 'youtube', label: 'YouTube', icon: 'fa-brands fa-youtube', color: '#ff0000', placeholder: '@channel or url' },
+                      { key: 'github', label: 'GitHub', icon: 'fa-brands fa-github', color: '#333333', placeholder: 'username or url' },
+                      { key: 'linkedin', label: 'LinkedIn', icon: 'fa-brands fa-linkedin-in', color: '#0a66c2', placeholder: 'username or profile url' },
+                      { key: 'tiktok', label: 'TikTok', icon: 'fa-brands fa-tiktok', color: '#000000', placeholder: '@handle or url' },
+                      { key: 'spotify', label: 'Spotify', icon: 'fa-brands fa-spotify', color: '#1db954', placeholder: 'artist, show, or playlist url' },
+                      { key: 'discord', label: 'Discord', icon: 'fa-brands fa-discord', color: '#5865f2', placeholder: 'server invite code or url' },
+                      { key: 'twitch', label: 'Twitch', icon: 'fa-brands fa-twitch', color: '#9146ff', placeholder: 'channel username or url' },
+                      { key: 'email', label: 'Email Address', icon: 'fa-solid fa-envelope', color: '#ea4335', placeholder: 'you@example.com' },
+                      { key: 'whatsapp', label: 'WhatsApp', icon: 'fa-brands fa-whatsapp', color: '#25d366', placeholder: 'Phone or wa.me link' },
+                      { key: 'website', label: 'Personal Website', icon: 'fa-solid fa-globe', color: '#3b82f6', placeholder: 'https://example.com' },
+                    ].map((item) => (
+                      <div key={item.key}>
+                        <label htmlFor={`socialInput_${item.key}`} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '5px' }}>
+                          <i className={item.icon} style={{ color: item.color, width: '16px', textAlign: 'center' }}></i>
+                          {item.label}
+                        </label>
+                        <input
+                          type="text"
+                          id={`socialInput_${item.key}`}
+                          placeholder={item.placeholder}
+                          value={editSocialLinks[item.key as keyof SocialLinks] || ''}
+                          onChange={(e) =>
+                            setEditSocialLinks({
+                              ...editSocialLinks,
+                              [item.key]: e.target.value,
+                            })
+                          }
+                          style={{
+                            width: '100%',
+                            padding: '7px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid var(--border-color)',
+                            backgroundColor: 'var(--bg-secondary)',
+                            color: 'var(--text-primary)',
+                            fontSize: '0.84rem',
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Save Bar */}
+                <div
+                  style={{
+                    backgroundColor: 'var(--bg-card)',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: '12px',
+                    padding: '16px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: '12px',
+                    boxShadow: 'var(--shadow-sm)',
+                  }}
+                >
+                  <div>
+                    <strong style={{ fontSize: '0.92rem', color: 'var(--text-primary)' }}>
+                      Ready to apply your new profile look?
+                    </strong>
+                    <span style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      Changes will be saved to your account and visible at https://linkmanager.in/{editUsernameInput}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      id="saveProfileSettingsBtn"
+                      className="btn btn-primary"
+                      style={{ padding: '8px 20px', fontSize: '0.92rem', fontWeight: 600 }}
+                      onClick={handleSaveProfileCustomization}
+                      disabled={isSavingProfile}
+                    >
+                      {isSavingProfile ? (
+                        <>
+                          <i className="fa-solid fa-spinner fa-spin"></i> Saving...
+                        </>
+                      ) : (
+                        <>
+                          <i className="fa-solid fa-floppy-disk"></i> Save Profile & Theme
+                        </>
+                      )}
+                    </button>
+                    <button
+                      id="saveAndViewPublicBtn"
+                      className="btn btn-secondary"
+                      style={{ padding: '8px 16px', fontSize: '0.92rem' }}
+                      onClick={async () => {
+                        await handleSaveProfileCustomization();
+                        handleNavigateToPublicProfile(editUsernameInput);
+                      }}
+                    >
+                      <i className="fa-solid fa-arrow-up-right-from-square"></i> View Live
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 2: Links & Privacy Management */}
+          {settingsActiveTab === 'links' && (
+            <div id="settingsLinksManagementSection">
           {/* Personal Public Page & Subfolder Setup */}
           <div className="settings-profile-card" id="profileSettingsCard">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
@@ -2802,6 +4197,8 @@ export default function App() {
               )}
             </div>
           </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -2828,22 +4225,6 @@ export default function App() {
                     title="Product Overview & Features"
                   >
                     <i className="fa-solid fa-house"></i> Home
-                  </button>
-                  <button
-                    id="publicToSettingsBtn"
-                    className="btn btn-secondary"
-                    onClick={() => setCurrentView('settings')}
-                    style={{ fontSize: '0.85rem' }}
-                  >
-                    <i className="fa-solid fa-sliders"></i> Link Settings
-                  </button>
-                  <button
-                    id="publicToDashboardBtn"
-                    className="btn btn-primary"
-                    onClick={handleBackToDashboard}
-                    style={{ fontSize: '0.85rem' }}
-                  >
-                    <i className="fa-solid fa-table-columns"></i> My Dashboard
                   </button>
                 </div>
               ) : (
@@ -2891,10 +4272,12 @@ export default function App() {
               style={{
                 backgroundColor: 'rgba(37, 99, 235, 0.08)',
                 borderBottom: '1px solid rgba(37, 99, 235, 0.2)',
-                padding: '8px 24px',
+                padding: '8px 16px',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: '8px',
                 fontSize: '0.85rem',
                 color: 'var(--primary-color)',
               }}
@@ -2903,89 +4286,252 @@ export default function App() {
                 <i className="fa-regular fa-eye"></i>
                 <span>You are viewing your public page as visitors see it.</span>
               </div>
-              <button
-                className="btn btn-secondary"
-                style={{ fontSize: '0.78rem', padding: '4px 10px' }}
-                onClick={() => setCurrentView('settings')}
-              >
-                <i className="fa-solid fa-sliders"></i> Manage in Link Settings
-              </button>
+              <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                <button
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.78rem', padding: '4px 10px' }}
+                  onClick={() => setCurrentView('settings')}
+                >
+                  <i className="fa-solid fa-sliders"></i> Link Settings
+                </button>
+                <button
+                  className="btn btn-primary"
+                  style={{ fontSize: '0.78rem', padding: '4px 10px' }}
+                  onClick={handleBackToDashboard}
+                >
+                  <i className="fa-solid fa-table-columns"></i> Dashboard
+                </button>
+              </div>
             </div>
           )}
 
           {/* Public Profile Main Content */}
           <div className="public-profile-content">
-            {/* Hero Profile Card */}
-            <div className="public-profile-hero" id="publicProfileHero">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
-                {publicProfileUser?.photoURL ? (
-                  <img
-                    src={publicProfileUser.photoURL}
-                    alt="User avatar"
-                    className="public-avatar"
-                  />
-                ) : (
-                  <div className="public-avatar">
-                    {(publicProfileUser?.displayName || publicProfileUsername || 'U')[0].toUpperCase()}
-                  </div>
-                )}
+            {/* Themed Hero Profile Card */}
+            {(() => {
+              const activeTheme = getThemeById(publicProfileUser?.themeTemplate);
+              const bannerImage = publicProfileUser?.bannerUrl || getBannerSvg(publicProfileUser?.bannerStyle, publicProfileUser?.themeTemplate);
+              const isOwner = Boolean(currentUser && (currentUser.uid === publicProfileUser?.uid || userUsername === publicProfileUsername));
+              const currentShareUrl = publicCategory !== 'All'
+                ? getCategoryShareUrl(publicCategory, publicProfileUsername)
+                : getProfileShareUrl(publicProfileUsername);
 
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                    <h2 style={{ margin: 0, fontSize: '1.45rem', fontWeight: 700 }}>
-                      {publicProfileUser?.displayName || publicProfileUsername}
-                    </h2>
-                    <span
-                      className="badge"
+              return (
+                <div
+                  className="profile-themed-hero"
+                  id="publicProfileHero"
+                  style={{
+                    backgroundColor: activeTheme.heroBg.startsWith('linear') ? undefined : activeTheme.heroBg,
+                    backgroundImage: activeTheme.heroBg.startsWith('linear') ? activeTheme.heroBg : undefined,
+                    borderColor: activeTheme.heroBorder,
+                    marginBottom: '24px',
+                  }}
+                >
+                  {/* Banner Graphic Header */}
+                  <div className="profile-hero-banner-container" style={{ height: '140px' }}>
+                    <img
+                      src={bannerImage}
+                      alt="Profile Banner"
+                      className="profile-hero-banner-image"
+                    />
+                    <div
                       style={{
-                        backgroundColor: 'rgba(16, 185, 129, 0.12)',
-                        color: '#10b981',
-                        borderColor: 'rgba(16, 185, 129, 0.3)',
-                        fontSize: '0.75rem',
+                        position: 'absolute',
+                        inset: 0,
+                        background: 'linear-gradient(to bottom, rgba(0,0,0,0) 40%, rgba(0,0,0,0.5) 100%)',
+                        pointerEvents: 'none',
                       }}
-                    >
-                      <i className="fa-solid fa-globe"></i> Public Collection
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-                    <span style={{ fontWeight: 600, color: 'var(--primary-color)' }}>
-                      @{publicProfileUser?.username || publicProfileUsername}
-                    </span>
-                    <span>•</span>
-                    <span>{publicFilteredLinks.length} public link{publicFilteredLinks.length === 1 ? '' : 's'} shared</span>
-                  </div>
-                  <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                    https://linkmanager.in/{publicProfileUser?.username || publicProfileUsername}
-                  </span>
-                </div>
-              </div>
+                    />
 
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <button
-                  id="sharePublicProfileBtn"
-                  className="btn btn-primary"
-                  onClick={() => handleCopyProfileUrl(publicProfileUsername)}
-                  style={{ fontSize: '0.85rem' }}
-                >
-                  <i className="fa-solid fa-share-nodes"></i> Share Public Page
-                </button>
-                <button
-                  id="publicProfileQrBtn"
-                  className="btn btn-secondary"
-                  onClick={() =>
-                    handleOpenQrModal(
-                      getProfileShareUrl(publicProfileUsername),
-                      `@${publicProfileUser?.displayName || publicProfileUsername}'s Links`,
-                      'Scan this QR code with any smartphone camera to open and bookmark these links on mobile'
-                    )
-                  }
-                  style={{ fontSize: '0.85rem' }}
-                  title="Generate QR code for this public page"
-                >
-                  <i className="fa-solid fa-qrcode" style={{ color: 'var(--primary-color)' }}></i> QR Code
-                </button>
-              </div>
-            </div>
+                    {/* Owner quick edit button on banner */}
+                    {isOwner && (
+                      <button
+                        id="ownerEditThemeBannerBtn"
+                        className="btn btn-secondary"
+                        onClick={() => {
+                          setSettingsActiveTab('appearance');
+                          setCurrentView('settings');
+                        }}
+                        style={{
+                          position: 'absolute',
+                          top: '10px',
+                          right: '12px',
+                          fontSize: '0.76rem',
+                          padding: '4px 10px',
+                          backgroundColor: 'rgba(255, 255, 255, 0.92)',
+                          backdropFilter: 'blur(4px)',
+                          borderColor: 'rgba(0, 0, 0, 0.1)',
+                          color: '#1e293b',
+                          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+                        }}
+                        title="Change theme, banner or profile photo"
+                      >
+                        <i className="fa-solid fa-wand-magic-sparkles" style={{ color: activeTheme.accentColor }}></i> Customize Theme
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Profile Body Info */}
+                  <div className="profile-hero-body" style={{ marginTop: '-42px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '16px', flexWrap: 'wrap' }}>
+                        {/* Avatar */}
+                        <div className="profile-hero-avatar-wrapper">
+                          {publicProfileUser?.photoURL ? (
+                            <img
+                              src={publicProfileUser.photoURL}
+                              alt="Avatar"
+                              className="profile-hero-avatar"
+                              style={{
+                                width: '84px',
+                                height: '84px',
+                                borderColor: activeTheme.heroBorder,
+                              }}
+                            />
+                          ) : (
+                            <div
+                              className="profile-hero-avatar"
+                              style={{
+                                width: '84px',
+                                height: '84px',
+                                backgroundColor: activeTheme.accentColor,
+                                borderColor: activeTheme.heroBorder,
+                                fontSize: '1.8rem',
+                              }}
+                            >
+                              {(publicProfileUser?.displayName || publicProfileUsername || 'U')[0].toUpperCase()}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Title, Badge & Meta */}
+                        <div style={{ paddingTop: '8px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <h2 style={{ margin: 0, fontSize: '1.45rem', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                              {publicProfileUser?.displayName || publicProfileUsername}
+                              {publicProfileUser?.verifiedBadge !== false && (
+                                <i
+                                  className="fa-solid fa-circle-check"
+                                  style={{ color: '#3b82f6', fontSize: '1.05rem' }}
+                                  title="Verified Creator Profile"
+                                ></i>
+                              )}
+                            </h2>
+                            <span
+                              className="badge"
+                              style={{
+                                backgroundColor: activeTheme.badgeBg,
+                                color: activeTheme.badgeColor,
+                                borderColor: activeTheme.heroBorder,
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                              }}
+                            >
+                              {activeTheme.id === 'flowerish' && <i className="fa-solid fa-heart" style={{ marginRight: '4px' }}></i>}
+                              {activeTheme.id === 'tech' && <i className="fa-solid fa-terminal" style={{ marginRight: '4px' }}></i>}
+                              {activeTheme.id === 'sunset' && <i className="fa-solid fa-sun" style={{ marginRight: '4px' }}></i>}
+                              {activeTheme.id === 'emerald' && <i className="fa-solid fa-leaf" style={{ marginRight: '4px' }}></i>}
+                              {activeTheme.id === 'darkluxury' && <i className="fa-solid fa-crown" style={{ marginRight: '4px' }}></i>}
+                              {activeTheme.id === 'default' && <i className="fa-solid fa-globe" style={{ marginRight: '4px' }}></i>}
+                              {activeTheme.name}
+                            </span>
+                          </div>
+
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                            <span style={{ fontWeight: 600, color: activeTheme.accentColor }}>
+                              @{publicProfileUser?.username || publicProfileUsername}
+                            </span>
+                            <span>•</span>
+                            <span>{publicFilteredLinks.length} public link{publicFilteredLinks.length === 1 ? '' : 's'}</span>
+                          </div>
+
+                          {/* Bio Tagline */}
+                          {publicProfileUser?.bio && (
+                            <p className="profile-bio-text" style={{ fontStyle: 'italic', marginTop: '6px', fontSize: '0.9rem', maxWidth: '640px' }}>
+                              "{publicProfileUser.bio}"
+                            </p>
+                          )}
+
+                          {/* Social Channels Bar */}
+                          {renderSocialLinksBar(publicProfileUser?.socialLinks, 'publicSocial')}
+
+                          {/* Link URL pill */}
+                          <div
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '6px',
+                              fontSize: '0.8rem',
+                              color: 'var(--text-secondary)',
+                              cursor: 'pointer',
+                              marginTop: '6px',
+                              transition: 'color 0.15s ease',
+                            }}
+                            id="publicMainUrlDisplay"
+                            onClick={() => {
+                              navigator.clipboard.writeText(currentShareUrl).then(() => {
+                                setCopyNotification(`Copied: ${currentShareUrl}`);
+                                setTimeout(() => setCopyNotification(null), 2500);
+                              });
+                            }}
+                            title="Click to copy public link"
+                          >
+                            <span>
+                              https://linkmanager.in/{publicProfileUser?.username || publicProfileUsername}
+                              {publicCategory !== 'All' ? `/${slugifyCategory(publicCategory)}` : ''}
+                            </span>
+                            <i className="fa-regular fa-copy" style={{ fontSize: '0.75rem', opacity: 0.7 }}></i>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Action buttons (Share & QR) */}
+                      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', alignSelf: 'center' }}>
+                        <button
+                          id="sharePublicProfileBtn"
+                          className="btn btn-primary"
+                          onClick={() => {
+                            if (publicCategory !== 'All') {
+                              handleCopyCategoryShareUrl(publicCategory, publicProfileUsername);
+                            } else {
+                              handleCopyProfileUrl(publicProfileUsername);
+                            }
+                          }}
+                          style={{
+                            fontSize: '0.85rem',
+                            backgroundColor: activeTheme.accentColor,
+                            borderColor: activeTheme.accentColor,
+                          }}
+                          title={publicCategory !== 'All' ? `Share ${publicCategory} category link` : 'Share public profile link'}
+                        >
+                          <i className="fa-solid fa-share-nodes"></i> Share
+                        </button>
+                        <button
+                          id="publicProfileQrBtn"
+                          className="btn btn-secondary"
+                          onClick={() =>
+                            handleOpenQrModal(
+                              currentShareUrl,
+                              publicCategory !== 'All'
+                                ? `${publicCategory} Category Links`
+                                : `@${publicProfileUser?.displayName || publicProfileUsername}'s Links`,
+                              publicCategory !== 'All'
+                                ? `Scan this QR code with any smartphone camera to open @${publicProfileUsername}'s ${publicCategory} bookmarks on mobile`
+                                : 'Scan this QR code with any smartphone camera to open and bookmark these links on mobile',
+                              publicCategory !== 'All' ? publicCategory : undefined
+                            )
+                          }
+                          style={{ fontSize: '0.85rem' }}
+                          title={publicCategory !== 'All' ? `Generate QR code for ${publicCategory} category` : 'Generate QR code for this public page'}
+                        >
+                          <i className="fa-solid fa-qrcode" style={{ color: activeTheme.accentColor }}></i> QR
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Active Category Filter Banner */}
             {publicCategory !== 'All' && (
@@ -3020,8 +4566,9 @@ export default function App() {
                     className="btn btn-outline-sm"
                     onClick={() => handleCopyCategoryShareUrl(publicCategory, publicProfileUsername)}
                     title={`Copy share link for ${publicCategory}`}
+                    style={{ whiteSpace: 'nowrap' }}
                   >
-                    <i className="fa-solid fa-link"></i> Copy Category Link
+                    <i className="fa-solid fa-link"></i> Copy
                   </button>
                   <button
                     id="categoryQrBtn"
@@ -3035,8 +4582,9 @@ export default function App() {
                       )
                     }
                     title={`Show QR code for ${publicCategory}`}
+                    style={{ whiteSpace: 'nowrap' }}
                   >
-                    <i className="fa-solid fa-qrcode"></i> QR Code
+                    <i className="fa-solid fa-qrcode"></i> QR
                   </button>
                 </div>
               </div>
@@ -3076,15 +4624,59 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="search-box" style={{ width: '240px', height: '36px' }}>
-                <i className="fa-solid fa-magnifying-glass"></i>
-                <input
-                  type="text"
-                  id="publicSearchInput"
-                  placeholder="Search shared links..."
-                  value={publicSearch}
-                  onChange={(e) => setPublicSearch(e.target.value)}
-                />
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <div className="view-mode-pill-toggle" id="publicViewModeToggle">
+                  <button
+                    type="button"
+                    id="publicToggleLinktreeBtn"
+                    className={`view-mode-btn ${publicViewMode === 'linktree' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPublicViewMode('linktree');
+                      setIsCompactView(false);
+                    }}
+                    title="Linktree Stack view"
+                  >
+                    <i className="fa-solid fa-bars-staggered"></i>
+                    <span className="view-mode-label">Linktree</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="publicToggleCompactBtn"
+                    className={`view-mode-btn ${publicViewMode === 'compact' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPublicViewMode('compact');
+                      setIsCompactView(true);
+                    }}
+                    title="Short Tab view"
+                  >
+                    <i className="fa-solid fa-bars"></i>
+                    <span className="view-mode-label">Short Tab</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="publicToggleCardsBtn"
+                    className={`view-mode-btn ${publicViewMode === 'cards' ? 'active' : ''}`}
+                    onClick={() => {
+                      setPublicViewMode('cards');
+                      setIsCompactView(false);
+                    }}
+                    title="Cards view"
+                  >
+                    <i className="fa-solid fa-table-cells-large"></i>
+                    <span className="view-mode-label">Cards</span>
+                  </button>
+                </div>
+
+                <div className="search-box" style={{ width: '220px', height: '36px' }}>
+                  <i className="fa-solid fa-magnifying-glass"></i>
+                  <input
+                    type="text"
+                    id="publicSearchInput"
+                    placeholder="Search shared links..."
+                    value={publicSearch}
+                    onChange={(e) => setPublicSearch(e.target.value)}
+                  />
+                </div>
               </div>
             </div>
 
@@ -3111,11 +4703,182 @@ export default function App() {
                   </button>
                 )}
               </div>
-            ) : (
-              <div className="links-grid" id="publicLinksGrid">
+            ) : publicViewMode === 'linktree' ? (
+              <div className="linktree-container" id="publicLinktreeContainer">
                 {publicFilteredLinks.map((link) => {
                   const domain = getDomain(link.url);
                   const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+                  const isSpotlight = Boolean(link.isHighlighted);
+                  const buttonStyleClass = `style-${publicProfileUser?.buttonStyle || 'pill'}`;
+
+                  return (
+                    <div key={link.id} id={`public-linktree-wrapper-${link.id}`} style={{ width: '100%', position: 'relative' }}>
+                      <a
+                        href={link.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={`linktree-btn ${buttonStyleClass} ${isSpotlight ? 'is-spotlight' : ''}`}
+                        id={`publicLinktreeBtn-${link.id}`}
+                        title={`Open ${link.title}`}
+                        onClick={() => handleTrackLinkClick(link)}
+                      >
+                        <div className="linktree-btn-left">
+                          <div className="linktree-btn-icon-wrapper">
+                            <img
+                              src={faviconUrl}
+                              className="linktree-btn-icon-img"
+                              alt=""
+                              onError={(e) => {
+                                (e.target as HTMLImageElement).src =
+                                  'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                              }}
+                            />
+                          </div>
+                          <div className="linktree-btn-content">
+                            <div className="linktree-btn-title-row">
+                              <span className="linktree-btn-title">{link.title}</span>
+                              {isSpotlight && (
+                                <span className="spotlight-badge" title="Linktree Spotlight Featured">
+                                  <i className="fa-solid fa-bolt"></i> Spotlight
+                                </span>
+                              )}
+                            </div>
+                            <span className="linktree-btn-subtitle">
+                              {link.description || domain}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="linktree-btn-right" onClick={(e) => e.stopPropagation()}>
+                          <span
+                            className="click-count-badge compact"
+                            id={`publicLtClickBadge-${link.id}`}
+                            title={`${(link.clickCount || 0).toLocaleString()} total ${(link.clickCount || 0) === 1 ? 'click' : 'clicks'}`}
+                          >
+                            <i className="fa-solid fa-arrow-pointer"></i>
+                            <span>{(link.clickCount || 0).toLocaleString()}</span>
+                          </span>
+
+                          <button
+                            type="button"
+                            className="linktree-btn-action-btn"
+                            id={`publicLtCopyBtn-${link.id}`}
+                            title="Copy URL"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              copyToClipboard(link.url);
+                            }}
+                          >
+                            <i className="fa-regular fa-copy"></i>
+                          </button>
+
+                          <button
+                            type="button"
+                            className="linktree-btn-action-btn"
+                            id={`publicLtQrBtn-${link.id}`}
+                            title="Show QR Code"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleOpenQrModal(
+                                link.url,
+                                link.title,
+                                `Scan with smartphone camera to open ${link.title} on mobile`,
+                                link.category
+                              );
+                            }}
+                          >
+                            <i className="fa-solid fa-qrcode"></i>
+                          </button>
+
+                          <span className="linktree-btn-arrow">
+                            <i className="fa-solid fa-arrow-up-right-from-square"></i>
+                          </span>
+                        </div>
+                      </a>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className={`links-grid ${publicViewMode === 'compact' ? 'compact-mode' : ''}`} id="publicLinksGrid">
+                {publicFilteredLinks.map((link) => {
+                  const domain = getDomain(link.url);
+                  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+                  if (publicViewMode === 'compact') {
+                    return (
+                      <div className="card card-compact" key={link.id} id={`public-card-${link.id}`}>
+                        {/* Left: Icon + Title & Domain */}
+                        <div className="card-compact-left">
+                          <img
+                            src={faviconUrl}
+                            className="favicon compact-favicon"
+                            alt="Icon"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).src =
+                                'https://www.google.com/s2/favicons?domain=google.com&sz=64';
+                            }}
+                          />
+                          <div className="card-compact-title-area">
+                            <a
+                              href={link.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="card-title-link"
+                              id={`publicTitleLink-${link.id}`}
+                              title={`Open ${link.title}`}
+                              onClick={() => handleTrackLinkClick(link)}
+                            >
+                              <h4 className="compact-title">{link.title}</h4>
+                            </a>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '2px', flexWrap: 'wrap' }}>
+                              <span className="domain-tag compact-domain">{domain}</span>
+                              {link.isHighlighted && (
+                                <span className="spotlight-badge compact" title="Linktree Spotlight Featured">
+                                  <i className="fa-solid fa-bolt"></i> Spotlight
+                                </span>
+                              )}
+                              <span
+                                className="click-count-badge compact"
+                                id={`publicCompactClickBadge-${link.id}`}
+                                title={`${(link.clickCount || 0).toLocaleString()} total ${(link.clickCount || 0) === 1 ? 'click' : 'clicks'}`}
+                              >
+                                <i className="fa-solid fa-arrow-pointer"></i>
+                                <span>{(link.clickCount || 0).toLocaleString()}</span>
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Right: Only Copy and Open Link Icon */}
+                        <div className="card-compact-actions">
+                          <button
+                            id={`publicCopyBtn-${link.id}`}
+                            onClick={() => copyToClipboard(link.url)}
+                            title="Copy URL"
+                            className="compact-action-btn"
+                            aria-label="Copy URL"
+                          >
+                            <i className="fa-regular fa-copy"></i>
+                          </button>
+                          <a
+                            id={`publicOpenBtn-${link.id}`}
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Open Link in New Tab"
+                            className="compact-action-btn"
+                            aria-label="Open Link"
+                            onClick={() => handleTrackLinkClick(link)}
+                          >
+                            <i className="fa-solid fa-arrow-up-right-from-square"></i>
+                          </a>
+                        </div>
+                      </div>
+                    );
+                  }
 
                   return (
                     <div className="card" key={link.id} id={`public-card-${link.id}`}>
@@ -3138,6 +4901,7 @@ export default function App() {
                               className="card-title-link"
                               id={`publicTitleLink-${link.id}`}
                               title={`Open ${link.title}`}
+                              onClick={() => handleTrackLinkClick(link)}
                             >
                               <h4>{link.title}</h4>
                             </a>
@@ -3149,14 +4913,29 @@ export default function App() {
                         </p>
                       </div>
                       <div className="card-footer">
-                        <span
-                          className="badge"
-                          style={{ cursor: 'pointer' }}
-                          title={`Filter by ${link.category}`}
-                          onClick={() => handleSelectPublicCategory(link.category)}
-                        >
-                          {link.category}
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                          <span
+                            className="badge"
+                            style={{ cursor: 'pointer' }}
+                            title={`Filter by ${link.category}`}
+                            onClick={() => handleSelectPublicCategory(link.category)}
+                          >
+                            {link.category}
+                          </span>
+                          {link.isHighlighted && (
+                            <span className="spotlight-badge" title="Linktree Spotlight Featured Link">
+                              <i className="fa-solid fa-bolt"></i> Spotlight
+                            </span>
+                          )}
+                          <span
+                            className="click-count-badge"
+                            id={`publicClickCountBadge-${link.id}`}
+                            title={`${(link.clickCount || 0).toLocaleString()} total ${(link.clickCount || 0) === 1 ? 'click' : 'clicks'}`}
+                          >
+                            <i className="fa-solid fa-arrow-pointer"></i>
+                            <span>{(link.clickCount || 0).toLocaleString()} {(link.clickCount || 0) === 1 ? 'click' : 'clicks'}</span>
+                          </span>
+                        </div>
                         <div className="card-actions">
                           <button
                             id={`publicQrBtn-${link.id}`}
@@ -3185,6 +4964,7 @@ export default function App() {
                             target="_blank"
                             rel="noopener noreferrer"
                             title="Open Link in New Tab"
+                            onClick={() => handleTrackLinkClick(link)}
                           >
                             <i className="fa-solid fa-arrow-up-right-from-square"></i>
                           </a>
@@ -3334,7 +5114,7 @@ export default function App() {
                 </label>
               </div>
 
-              <div className="public-switch-bar" style={{ marginBottom: '1.25rem', marginTop: 0 }}>
+              <div className="public-switch-bar" style={{ marginBottom: '1rem', marginTop: 0 }}>
                 <div className="switch-label">
                   <span className="title">Public Access</span>
                   <span className="desc">Allow this bookmark to be shared publicly with others</span>
@@ -3345,6 +5125,24 @@ export default function App() {
                     id="formIsPublicToggle"
                     checked={formIsPublic}
                     onChange={(e) => setFormIsPublic(e.target.checked)}
+                  />
+                  <span className="toggle-slider"></span>
+                </label>
+              </div>
+
+              <div className="public-switch-bar" style={{ marginBottom: '1.25rem', marginTop: 0 }}>
+                <div className="switch-label">
+                  <span className="title" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <i className="fa-solid fa-bolt" style={{ color: '#f59e0b', fontSize: '0.85rem' }}></i> Linktree Spotlight / Priority
+                  </span>
+                  <span className="desc">Feature this link with animated pulse highlight and SPOTLIGHT badge</span>
+                </div>
+                <label className="toggle-switch" htmlFor="formIsHighlightedToggle">
+                  <input
+                    type="checkbox"
+                    id="formIsHighlightedToggle"
+                    checked={formIsHighlighted}
+                    onChange={(e) => setFormIsHighlighted(e.target.checked)}
                   />
                   <span className="toggle-slider"></span>
                 </label>

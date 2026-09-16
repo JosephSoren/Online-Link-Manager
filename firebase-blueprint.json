@@ -40,20 +40,39 @@
         "order": {
           "type": "number",
           "description": "Manual drag-and-drop sort index"
+        },
+        "clickCount": {
+          "type": "number",
+          "description": "Total count of clicks on this public link"
+        },
+        "isHighlighted": {
+          "type": "boolean",
+          "description": "Whether link is spotlighted/featured with Linktree-style pulse"
         }
       },
       "required": ["title", "url", "category", "createdAt"]
     },
     "UserProfile": {
       "title": "UserProfile",
-      "description": "User profile and public handle mappings",
+      "description": "User profile, public handle mappings and Linktree configurations",
       "type": "object",
       "properties": {
         "uid": { "type": "string" },
         "username": { "type": "string", "maxLength": 50 },
         "displayName": { "type": "string", "maxLength": 100 },
-        "photoURL": { "type": "string", "maxLength": 1000 },
-        "email": { "type": "string", "maxLength": 200 }
+        "photoURL": { "type": "string", "maxLength": 2000 },
+        "email": { "type": "string", "maxLength": 200 },
+        "bio": { "type": "string", "maxLength": 300 },
+        "themeTemplate": { "type": "string", "maxLength": 50 },
+        "bannerStyle": { "type": "string", "maxLength": 50 },
+        "bannerUrl": { "type": "string", "maxLength": 2000 },
+        "buttonStyle": { "type": "string", "maxLength": 30 },
+        "defaultView": { "type": "string", "maxLength": 30 },
+        "verifiedBadge": { "type": "boolean" },
+        "socialLinks": {
+          "type": "object",
+          "description": "Social media handles and links for public bio"
+        }
       },
       "required": ["uid", "username"]
     }

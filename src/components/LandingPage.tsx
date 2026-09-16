@@ -140,7 +140,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 className="btn btn-primary"
                 onClick={onLaunchDashboard}
               >
-                <i className="fa-solid fa-table-columns"></i> Go to Dashboard
+                <i className="fa-solid fa-table-columns"></i> Dashboard
               </button>
             ) : (
               <>
@@ -156,7 +156,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                   className="btn btn-primary"
                   onClick={onLaunchDashboard}
                 >
-                  Open Dashboard <i className="fa-solid fa-arrow-right"></i>
+                  Dashboard <i className="fa-solid fa-arrow-right"></i>
                 </button>
               </>
             )}
