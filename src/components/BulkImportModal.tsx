@@ -86,6 +86,73 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
     setErrorMessage(null);
   };
 
+  // Helper to extract URLs and generate metadata directly on client
+  const extractUrlsFromTextClient = (
+    inputText: string
+  ): Array<{ url: string; title: string; description: string; category: string }> => {
+    if (!inputText || !inputText.trim()) return [];
+    // Matches http://, https://, www., or domain names with common TLDs
+    const urlRegex =
+      /(https?:\/\/[^\s<>"'{}|\\^`]+|www\.[^\s<>"'{}|\\^`]+|[a-zA-Z0-9][-a-zA-Z0-9]{0,62}\.(?:com|org|net|io|dev|in|co|app|ai|me|edu|gov|xyz|site|online|tech|info|biz|tv|cc|to)(?:\/[^\s<>"'{}|\\^`]*)?)/gi;
+    const matches = inputText.match(urlRegex) || [];
+    const results: Array<{ url: string; title: string; description: string; category: string }> = [];
+    const seen = new Set<string>();
+
+    for (const m of matches) {
+      let clean = m.trim().replace(/[.,;:)>\]]+$/, '');
+      if (!clean.includes('.')) continue;
+      let full = clean;
+      if (!full.startsWith('http://') && !full.startsWith('https://')) {
+        full = 'https://' + full;
+      }
+      const lower = full.toLowerCase();
+      if (seen.has(lower)) continue;
+      seen.add(lower);
+
+      let host = '';
+      try {
+        host = new URL(full).hostname.replace(/^www\./, '');
+      } catch {
+        host = clean;
+      }
+
+      let title = host.charAt(0).toUpperCase() + host.slice(1);
+      try {
+        const uObj = new URL(full);
+        const pathParts = uObj.pathname.split('/').filter(Boolean);
+        if (pathParts.length > 0) {
+          const lastPart = decodeURIComponent(pathParts[pathParts.length - 1]).replace(/[-_+]/g, ' ');
+          if (lastPart.length > 2 && lastPart.length < 50) {
+            title = `${title} - ${lastPart.charAt(0).toUpperCase() + lastPart.slice(1)}`;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      let category = 'Work';
+      const l = full.toLowerCase();
+      if (l.includes('font') || l.includes('tool') || l.includes('generator') || l.includes('calc') || l.includes('convert') || l.includes('edit')) {
+        category = 'Tools';
+      } else if (l.includes('github') || l.includes('gitlab') || l.includes('jira') || l.includes('notion') || l.includes('slack')) {
+        category = 'Work';
+      } else if (l.includes('twitter') || l.includes('x.com') || l.includes('linkedin') || l.includes('instagram') || l.includes('reddit') || l.includes('youtube')) {
+        category = 'Social';
+      } else if (l.includes('medium') || l.includes('dev.to') || l.includes('blog') || l.includes('news') || l.includes('article') || l.includes('doc')) {
+        category = 'Reading';
+      }
+
+      results.push({
+        url: full,
+        title,
+        description: `Imported resource from ${host}`,
+        category: availableCategories.includes(category) ? category : defaultCategory,
+      });
+    }
+
+    return results;
+  };
+
   // Convert file to Base64
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
@@ -102,10 +169,11 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
   const handleExtractLinks = async () => {
     setErrorMessage(null);
     setIsProcessing(true);
-    setProcessingStatus('Reading content & analyzing document...');
+    setProcessingStatus('Analyzing document and extracting links...');
 
     try {
-      let payload: any = {};
+      let clientExtracted: Array<{ url: string; title: string; description: string; category: string }> = [];
+      let payload: any = null;
 
       if (activeTab === 'upload') {
         if (!selectedFile) {
@@ -114,15 +182,55 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
           return;
         }
 
-        setProcessingStatus(`Analyzing ${selectedFile.name} with AI...`);
-        const base64Data = await fileToBase64(selectedFile);
+        const isTxt = selectedFile.name.toLowerCase().endsWith('.txt') || selectedFile.type.includes('text');
+        const isPdf = selectedFile.name.toLowerCase().endsWith('.pdf') || selectedFile.type === 'application/pdf';
 
-        payload = {
-          fileData: base64Data,
-          mimeType: selectedFile.type || (selectedFile.name.endsWith('.pdf') ? 'application/pdf' : 'text/plain'),
-          fileName: selectedFile.name,
-        };
+        if (isTxt) {
+          setProcessingStatus(`Reading text file: ${selectedFile.name}...`);
+          try {
+            const fileText = await selectedFile.text();
+            clientExtracted = extractUrlsFromTextClient(fileText);
+            payload = { text: fileText };
+          } catch (e) {
+            console.warn('Text file read note:', e);
+          }
+        } else if (isPdf) {
+          setProcessingStatus(`Scanning PDF: ${selectedFile.name}...`);
+          try {
+            const buffer = await selectedFile.arrayBuffer();
+            const pdfLatinText = new TextDecoder('latin1').decode(buffer);
+            // Scan for direct URLs and /URI (https://...) in PDF
+            const pdfUrls = extractUrlsFromTextClient(pdfLatinText);
+            const uriMatches = pdfLatinText.match(/\/URI\s*\(([^)]+)\)/g) || [];
+            const additionalUrls: string[] = [];
+            for (const um of uriMatches) {
+              const cleaned = um.replace(/^\/URI\s*\(/, '').replace(/\)$/, '').trim();
+              if (cleaned && !additionalUrls.includes(cleaned)) additionalUrls.push(cleaned);
+            }
+            const combinedPdfText = additionalUrls.join('\n') + '\n' + pdfLatinText;
+            clientExtracted = extractUrlsFromTextClient(combinedPdfText);
+          } catch (e) {
+            console.warn('PDF client scan note:', e);
+          }
+
+          const base64Data = await fileToBase64(selectedFile);
+          payload = {
+            fileData: base64Data,
+            mimeType: 'application/pdf',
+            fileName: selectedFile.name,
+          };
+        } else {
+          // Images (.png, .jpg, .jpeg, .webp)
+          setProcessingStatus(`Analyzing image with AI: ${selectedFile.name}...`);
+          const base64Data = await fileToBase64(selectedFile);
+          payload = {
+            fileData: base64Data,
+            mimeType: selectedFile.type || 'image/png',
+            fileName: selectedFile.name,
+          };
+        }
       } else {
+        // Text tab
         if (!pastedText.trim()) {
           setErrorMessage('Please paste or type text containing web links.');
           setIsProcessing(false);
@@ -130,37 +238,84 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         }
 
         setProcessingStatus('Extracting links and smart descriptions...');
+        clientExtracted = extractUrlsFromTextClient(pastedText);
         payload = {
           text: pastedText.trim(),
         };
       }
 
-      const res = await fetch('/api/extract-links', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
+      // Try server extraction with AI
+      let serverLinks: any[] = [];
+      let apiError: string | null = null;
 
-      const data = await res.json();
+      if (payload) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 12000);
 
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to extract links');
+          const res = await fetch('/api/extract-links', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutId);
+
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const data = await res.json();
+            if (res.ok && data?.links && Array.isArray(data.links) && data.links.length > 0) {
+              serverLinks = data.links;
+            } else if (data?.error) {
+              apiError = data.error;
+            }
+          } else {
+            console.warn('Server returned non-JSON response:', res.status, contentType);
+          }
+        } catch (fetchErr: any) {
+          console.warn('API call skipped or failed, using local extraction:', fetchErr?.message || fetchErr);
+        }
       }
 
-      if (!data.links || data.links.length === 0) {
-        setErrorMessage('No web links or URLs were found in the uploaded file/text. Please ensure the file contains valid website links.');
+      // Combine server links and client extracted links (prefer server AI links if present)
+      let finalLinks: Array<{ url: string; title: string; description: string; category: string }> = [];
+
+      if (serverLinks.length > 0) {
+        finalLinks = serverLinks;
+        // Merge any client-extracted links that AI may have missed
+        const existing = new Set(serverLinks.map((l) => l.url.toLowerCase()));
+        for (const cl of clientExtracted) {
+          if (!existing.has(cl.url.toLowerCase())) {
+            finalLinks.push(cl);
+            existing.add(cl.url.toLowerCase());
+          }
+        }
+      } else if (clientExtracted.length > 0) {
+        finalLinks = clientExtracted;
+      }
+
+      if (finalLinks.length === 0) {
+        if (apiError) {
+          setErrorMessage(apiError);
+        } else {
+          setErrorMessage(
+            activeTab === 'upload' && selectedFile?.type?.startsWith('image/')
+              ? 'Could not extract links from this image. The AI image service might be busy, or no clear URL text was detected in the screenshot. Please try pasting the links directly in the "Paste Text" tab.'
+              : 'No web links or URLs were found in the uploaded file/text. Please ensure it contains valid website URLs (e.g. https://example.com).'
+          );
+        }
         setIsProcessing(false);
         return;
       }
 
       // Format links for preview table
-      const formatted: ExtractedLinkItem[] = data.links.map((item: any, idx: number) => ({
+      const formatted: ExtractedLinkItem[] = finalLinks.map((item: any, idx: number) => ({
         id: `extracted-${Date.now()}-${idx}`,
         url: item.url,
         title: item.title || item.url,
-        description: item.description || '',
+        description: item.description || `Imported resource`,
         category: availableCategories.includes(item.category) ? item.category : defaultCategory,
         isPublic: false,
         selected: true,
@@ -170,7 +325,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
       setStep('preview');
     } catch (err: any) {
       console.error('Extraction error:', err);
-      setErrorMessage(err.message || 'Network error while extracting links.');
+      setErrorMessage(err.message || 'Error occurred while extracting links.');
     } finally {
       setIsProcessing(false);
       setProcessingStatus('');

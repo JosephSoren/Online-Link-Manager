@@ -361,7 +361,7 @@ Return ONLY a valid JSON array of objects:
 ]
 If no URLs or links are found, return an empty JSON array: [].`;
 
-        const modelsToTry = ['gemini-2.5-flash', 'gemini-3.8-flash'];
+        const modelsToTry = ['gemini-flash-latest', 'gemini-3.8-flash'];
         let lastError: any = null;
         let responseJson = '';
 
@@ -395,15 +395,8 @@ If no URLs or links are found, return an empty JSON array: [].`;
           }
         }
 
-        if (lastError && !responseJson) {
-          console.error('Gemini multimodal extraction error:', lastError);
-          return res.status(500).json({
-            error: cleanErrorMessage(lastError),
-          });
-        }
-
         try {
-          const parsed = JSON.parse(responseJson);
+          const parsed = JSON.parse(responseJson || '[]');
           if (Array.isArray(parsed)) {
             extractedLinks = parsed
               .map((item: any) => ({
@@ -416,6 +409,42 @@ If no URLs or links are found, return an empty JSON array: [].`;
           }
         } catch {
           // ignore JSON parse error
+        }
+
+        // Direct scan fallback for PDF documents
+        if (mimeType === 'application/pdf') {
+          try {
+            const rawPdf = Buffer.from(cleanBase64, 'base64').toString('latin1');
+            const pdfUrls = rawPdf.match(urlRegex) || [];
+            const uriMatches = rawPdf.match(/\/URI\s*\(([^)]+)\)/g) || [];
+            const candidateUrls = [...pdfUrls];
+            for (const um of uriMatches) {
+              const cleaned = um.replace(/^\/URI\s*\(/, '').replace(/\)$/, '').trim();
+              if (cleaned) candidateUrls.push(cleaned);
+            }
+            for (const u of candidateUrls) {
+              const norm = normalizeUrl(u);
+              if (norm.startsWith('http') && !extractedLinks.some(l => l.url.toLowerCase() === norm.toLowerCase())) {
+                let host = norm;
+                try { host = new URL(norm).hostname.replace(/^www\./, ''); } catch {}
+                extractedLinks.push({
+                  url: norm,
+                  title: host.charAt(0).toUpperCase() + host.slice(1),
+                  description: `Resource from ${host}`,
+                  category: 'Work',
+                });
+              }
+            }
+          } catch (pdfErr) {
+            console.warn('PDF direct scan note:', pdfErr);
+          }
+        }
+
+        if (lastError && extractedLinks.length === 0) {
+          console.error('Gemini multimodal extraction error:', lastError);
+          return res.status(500).json({
+            error: cleanErrorMessage(lastError),
+          });
         }
       } else {
         // Plain text or .txt file upload
@@ -457,7 +486,7 @@ Return ONLY a JSON array:
 ]
 If none found, return [].`;
 
-            const textModels = ['gemini-2.5-flash', 'gemini-3.8-flash'];
+            const textModels = ['gemini-flash-latest', 'gemini-3.8-flash'];
             let aiRes: any = null;
             for (const m of textModels) {
               try {
