@@ -48,6 +48,10 @@
         "isHighlighted": {
           "type": "boolean",
           "description": "Whether link is spotlighted/featured with Linktree-style pulse"
+        },
+        "lastClickedAt": {
+          "type": "string",
+          "description": "ISO timestamp of when the link was last clicked or accessed"
         }
       },
       "required": ["title", "url", "category", "createdAt"]

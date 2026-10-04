@@ -119,11 +119,413 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '50mb' }));
+
+  // Helper to decode HTML entities
+  function decodeHtmlEntities(str: string): string {
+    return str
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&#x27;/g, "'")
+      .replace(/&nbsp;/g, ' ');
+  }
+
+  // Extract meta tag content from HTML
+  function extractMeta(html: string, propOrName: string): string | null {
+    const regex = new RegExp(`<meta[^>]+(?:name|property)=["']${propOrName}["'][^>]+content=["']([^"']*)["']`, 'i');
+    const match = html.match(regex);
+    if (match && match[1]) return decodeHtmlEntities(match[1].trim());
+
+    const regexInverted = new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:name|property)=["']${propOrName}["']`, 'i');
+    const matchInverted = html.match(regexInverted);
+    if (matchInverted && matchInverted[1]) return decodeHtmlEntities(matchInverted[1].trim());
+
+    return null;
+  }
+
+  // Helper withTimeout promise wrapper
+  const withTimeout = <T>(promise: Promise<T>, ms: number, desc: string): Promise<T> => {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${desc} timed out after ${ms}ms`)), ms))
+    ]);
+  };
+
+  function cleanErrorMessage(err: any): string {
+    if (!err) return 'An unexpected error occurred during link extraction.';
+    const msg = typeof err === 'string' ? err : err.message || '';
+    try {
+      const jsonMatch = msg.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (parsed?.error?.message) {
+          if (parsed.error.code === 503 || parsed.error.status === 'UNAVAILABLE' || parsed.error.message.includes('high demand')) {
+            return 'The AI service is experiencing temporary high demand. Please try extracting again in a moment.';
+          }
+          return parsed.error.message;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    if (msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand')) {
+      return 'The AI service is experiencing temporary high demand. Please try extracting again in a moment.';
+    }
+    return msg;
+  }
 
   // Health check endpoint
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok' });
+  });
+
+  // API Route: Automatically fetch title and description for pasted URL
+  app.post('/api/fetch-metadata', async (req, res) => {
+    try {
+      let { url = '' } = req.body;
+      if (!url || typeof url !== 'string') {
+        return res.status(400).json({ error: 'URL is required' });
+      }
+      url = url.trim();
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'https://' + url;
+      }
+
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(url);
+      } catch {
+        return res.status(400).json({ error: 'Invalid URL format' });
+      }
+
+      let scrapedTitle = '';
+      let scrapedDesc = '';
+
+      // Step 1: Attempt direct fetch with short timeout
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 4000);
+        const resp = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+        clearTimeout(timeoutId);
+
+        if (resp.ok) {
+          const text = await resp.text();
+          const titleMatch = text.match(/<title[^>]*>([^<]*)<\/title>/i);
+          if (titleMatch && titleMatch[1]) {
+            scrapedTitle = decodeHtmlEntities(titleMatch[1].trim());
+          }
+
+          const ogTitle = extractMeta(text, 'og:title');
+          const twitterTitle = extractMeta(text, 'twitter:title');
+          if (ogTitle && ogTitle.length > 2) scrapedTitle = ogTitle;
+          else if (twitterTitle && twitterTitle.length > 2 && !scrapedTitle) scrapedTitle = twitterTitle;
+
+          const ogDesc = extractMeta(text, 'og:description');
+          const metaDesc = extractMeta(text, 'description');
+          const twDesc = extractMeta(text, 'twitter:description');
+          scrapedDesc = ogDesc || metaDesc || twDesc || '';
+        }
+      } catch (e: any) {
+        console.warn('Scraping direct error/timeout for', url, e?.message);
+      }
+
+      const hostname = parsedUrl.hostname.replace(/^www\./, '');
+      const cleanHostName = hostname.split('.')[0];
+      const capitalizedHost = cleanHostName.charAt(0).toUpperCase() + cleanHostName.slice(1);
+
+      let finalTitle = scrapedTitle;
+      let finalDesc = scrapedDesc;
+      let category = 'Work';
+
+      // Step 2: Use Gemini Flash to enhance, summarize, clean title and deduce category
+      const ai = getAI();
+      if (ai) {
+        try {
+          const prompt = `Analyze this web link:
+URL: ${url}
+Current Scraped Title: "${scrapedTitle}"
+Current Scraped Description: "${scrapedDesc}"
+
+Provide a clean title, a concise 1-sentence description (max 140 characters), and classify into ONE category from: ["Work", "Social", "Tools", "Reading", "Personal"].
+
+Return ONLY valid JSON in this format:
+{
+  "title": "Clean readable title",
+  "description": "Short accurate description",
+  "category": "Work"
+}`;
+
+          const aiRes = await Promise.race([
+            ai.models.generateContent({
+              model: 'gemini-3.8-flash',
+              contents: prompt,
+              config: {
+                responseMimeType: 'application/json',
+              },
+            }),
+            new Promise<null>((_, reject) => setTimeout(() => reject(new Error('AI timeout')), 4500))
+          ]);
+
+          if (aiRes && aiRes.text) {
+            const parsed = JSON.parse(aiRes.text.trim());
+            if (parsed.title) finalTitle = parsed.title;
+            if (parsed.description) finalDesc = parsed.description;
+            if (parsed.category) category = parsed.category;
+          }
+        } catch (aiErr: any) {
+          console.warn('AI metadata enhancement note:', aiErr?.message);
+        }
+      }
+
+      if (!finalTitle) {
+        finalTitle = capitalizedHost;
+      }
+      if (!finalDesc) {
+        finalDesc = `Resource from ${hostname}`;
+      }
+
+      return res.json({
+        ok: true,
+        url,
+        title: finalTitle,
+        description: finalDesc,
+        category,
+        domain: hostname,
+        favicon: `https://www.google.com/s2/favicons?domain=${hostname}&sz=64`
+      });
+    } catch (err: any) {
+      console.error('Fetch metadata error:', err);
+      return res.status(500).json({ error: err.message || 'Failed to fetch link metadata' });
+    }
+  });
+
+  // API Route: Extract multiple links from text, .txt, .pdf, or image uploads
+  app.post('/api/extract-links', async (req, res) => {
+    try {
+      const { text = '', fileData = '', mimeType = '', fileName = '' } = req.body;
+      const ai = getAI();
+
+      let extractedLinks: Array<{
+        url: string;
+        title: string;
+        description: string;
+        category: string;
+      }> = [];
+
+      const urlRegex = /https?:\/\/[^\s<>"'{}|\\^`]+|(?:www\.)[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s<>"'{}|\\^`]*)?/gi;
+
+      const normalizeUrl = (raw: string) => {
+        let u = raw.trim();
+        u = u.replace(/[.,;:)>\]]+$/, ''); // Strip trailing punctuation
+        if (!u.startsWith('http://') && !u.startsWith('https://')) {
+          u = 'https://' + u;
+        }
+        return u;
+      };
+
+      if (fileData && (mimeType.startsWith('image/') || mimeType === 'application/pdf')) {
+        // PDF or Image Upload: Use Gemini Multimodal
+        if (!ai) {
+          return res.status(503).json({ error: 'AI processing service is not configured.' });
+        }
+
+        const cleanBase64 = fileData.replace(/^data:.*?;base64,/, '');
+
+        const prompt = `You are an expert bookmark and link extractor.
+Analyze this uploaded ${mimeType === 'application/pdf' ? 'PDF document' : 'image/screenshot'} and extract ALL hyperlinks, website URLs, domain names, links, document references, and web resources mentioned or visible.
+
+For EACH link you identify:
+1. "url": Ensure it is a complete valid URL (starting with https:// or http://).
+2. "title": Meaningful, clean title of the website, tool, article, or resource.
+3. "description": A concise 1-sentence description or context.
+4. "category": Choose the most appropriate category from: ["Work", "Social", "Tools", "Reading", "Personal"].
+
+Return ONLY a valid JSON array of objects:
+[
+  {
+    "url": "https://example.com/resource",
+    "title": "Example Resource",
+    "description": "Short helpful note",
+    "category": "Work"
+  }
+]
+If no URLs or links are found, return an empty JSON array: [].`;
+
+        const modelsToTry = ['gemini-2.5-flash', 'gemini-3.8-flash'];
+        let lastError: any = null;
+        let responseJson = '';
+
+        for (const modelName of modelsToTry) {
+          try {
+            const response = await withTimeout(
+              ai.models.generateContent({
+                model: modelName,
+                contents: [
+                  { text: prompt },
+                  {
+                    inlineData: {
+                      mimeType: mimeType === 'application/pdf' ? 'application/pdf' : mimeType,
+                      data: cleanBase64,
+                    },
+                  },
+                ],
+                config: {
+                  responseMimeType: 'application/json',
+                },
+              }),
+              14000,
+              `Gemini multimodal extraction (${modelName})`
+            );
+            responseJson = response.text?.trim() || '[]';
+            lastError = null;
+            break;
+          } catch (err: any) {
+            console.warn(`Extraction with ${modelName} failed or busy:`, err?.message || err);
+            lastError = err;
+          }
+        }
+
+        if (lastError && !responseJson) {
+          console.error('Gemini multimodal extraction error:', lastError);
+          return res.status(500).json({
+            error: cleanErrorMessage(lastError),
+          });
+        }
+
+        try {
+          const parsed = JSON.parse(responseJson);
+          if (Array.isArray(parsed)) {
+            extractedLinks = parsed
+              .map((item: any) => ({
+                url: normalizeUrl(item.url || ''),
+                title: item.title || item.url || 'Saved Link',
+                description: item.description || '',
+                category: item.category || 'Work',
+              }))
+              .filter((item) => item.url && item.url.includes('.'));
+          }
+        } catch {
+          // ignore JSON parse error
+        }
+      } else {
+        // Plain text or .txt file upload
+        let content = text;
+        if (fileData && (mimeType.includes('text') || fileName.endsWith('.txt'))) {
+          try {
+            const cleanBase64 = fileData.replace(/^data:.*?;base64,/, '');
+            content = Buffer.from(cleanBase64, 'base64').toString('utf-8');
+          } catch {
+            content = text;
+          }
+        }
+
+        if (!content || !content.trim()) {
+          return res.status(400).json({ error: 'Please provide text or upload a valid file' });
+        }
+
+        // Regex matches for reliable fallback
+        const rawMatches: string[] = content.match(urlRegex) || [];
+        const distinctUrls: string[] = Array.from(new Set<string>(rawMatches.map(normalizeUrl)));
+
+        if (ai) {
+          try {
+            const prompt = `Extract all web URLs, bookmarks, and links from this text.
+Text content:
+"""
+${content.slice(0, 30000)}
+"""
+
+For each link, provide:
+- "url": complete full URL starting with https:// or http://
+- "title": concise clear title
+- "description": 1-sentence description
+- "category": one of ["Work", "Social", "Tools", "Reading", "Personal"]
+
+Return ONLY a JSON array:
+[
+  { "url": "https://...", "title": "...", "description": "...", "category": "Work" }
+]
+If none found, return [].`;
+
+            const textModels = ['gemini-2.5-flash', 'gemini-3.8-flash'];
+            let aiRes: any = null;
+            for (const m of textModels) {
+              try {
+                aiRes = await withTimeout(
+                  ai.models.generateContent({
+                    model: m,
+                    contents: prompt,
+                    config: {
+                      responseMimeType: 'application/json',
+                    },
+                  }),
+                  7000,
+                  `AI text extraction (${m})`
+                );
+                if (aiRes?.text) break;
+              } catch (mErr) {
+                console.warn(`Text extraction with ${m} note:`, mErr);
+              }
+            }
+
+            if (aiRes?.text) {
+              const parsed = JSON.parse(aiRes.text.trim() || '[]');
+              if (Array.isArray(parsed)) {
+                extractedLinks = parsed
+                  .map((item: any) => ({
+                    url: normalizeUrl(item.url || ''),
+                    title: item.title || item.url || 'Saved Link',
+                    description: item.description || '',
+                    category: item.category || 'Work',
+                  }))
+                  .filter((item) => item.url && item.url.includes('.'));
+              }
+            }
+          } catch (aiErr) {
+            console.warn('AI text extraction note:', aiErr);
+          }
+        }
+
+        // Merge any URLs found by regex that were not captured by AI
+        const existingUrls = new Set(extractedLinks.map((l) => l.url.toLowerCase()));
+        for (const u of distinctUrls) {
+          if (!existingUrls.has(u.toLowerCase())) {
+            let host = '';
+            try {
+              host = new URL(u).hostname.replace(/^www\./, '');
+            } catch {
+              host = u;
+            }
+            extractedLinks.push({
+              url: u,
+              title: host.charAt(0).toUpperCase() + host.slice(1),
+              description: `Imported resource from ${host}`,
+              category: 'Work',
+            });
+            existingUrls.add(u.toLowerCase());
+          }
+        }
+      }
+
+      return res.json({
+        ok: true,
+        count: extractedLinks.length,
+        links: extractedLinks,
+      });
+    } catch (err: any) {
+      console.error('Extract links error:', err);
+      return res.status(500).json({ error: err.message || 'Failed to extract links' });
+    }
   });
 
   // API Route: Generate preview thumbnail for link
@@ -145,13 +547,6 @@ async function startServer() {
 
       const selectedStyle = stylePrompts[style] || stylePrompts.modern;
       const promptText = `A crisp, professional 16:9 website preview card thumbnail banner for "${title}". Description: "${description || 'Digital web tool and productivity platform'}". Category: ${category}. Style: ${selectedStyle}. High quality digital art suitable for a modern bookmark card thumbnail, no watermark, no text errors.`;
-
-      const withTimeout = <T>(promise: Promise<T>, ms: number, desc: string): Promise<T> => {
-        return Promise.race([
-          promise,
-          new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${desc} timed out after ${ms}ms`)), ms))
-        ]);
-      };
 
       const ai = getAI();
 
@@ -187,7 +582,7 @@ async function startServer() {
         try {
           const svgResponse = await withTimeout(
             ai.models.generateContent({
-              model: 'gemini-flash-latest',
+              model: 'gemini-3.8-flash',
               contents: `Create a clean, self-contained SVG image (width="100%" height="100%" viewBox="0 0 640 360") to serve as an eye-catching bookmark preview thumbnail card for "${title}".
 Description: "${description || 'Web application and bookmark'}"
 Category: ${category}

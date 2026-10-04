@@ -31,6 +31,7 @@ export interface LinkItem {
   order?: number;
   clickCount?: number;
   isHighlighted?: boolean;
+  lastClickedAt?: string;
 }
 
 export interface UserProfile {

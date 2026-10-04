@@ -491,6 +491,19 @@ body {
   box-shadow: var(--shadow-md);
 }
 
+.modal-card {
+  background-color: #ffffff;
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.25), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+[data-theme="dark"] .modal-card {
+  background-color: #1e293b;
+}
+
 .modal-header {
   display: flex;
   justify-content: space-between;
@@ -3545,5 +3558,239 @@ body {
   color: var(--text-primary);
   padding: 8px 0;
 }
+
+/* ========================================================
+   BULK SELECTION MODE & AUTO-FETCH METADATA STYLES
+   ======================================================== */
+
+/* Sticky/Floating Bulk Actions Floating Bar */
+.bulk-actions-floating-bar {
+  position: sticky;
+  top: 72px;
+  z-index: 95;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+  padding: 12px 18px;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  animation: slideDownBulk 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideDownBulk {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.bulk-actions-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.bulk-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bulk-select-all-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-primary);
+}
+
+.bulk-count-badge {
+  background-color: rgba(37, 99, 235, 0.12);
+  color: var(--primary-color);
+  border: 1px solid rgba(37, 99, 235, 0.25);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 20px;
+}
+
+/* Card Selection Mode Styles */
+.card.is-bulk-selected,
+.card-compact.is-bulk-selected {
+  border-color: var(--primary-color) !important;
+  background-color: rgba(37, 99, 235, 0.04) !important;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.25) !important;
+}
+
+[data-theme="dark"] .card.is-bulk-selected,
+[data-theme="dark"] .card-compact.is-bulk-selected {
+  background-color: rgba(37, 99, 235, 0.1) !important;
+}
+
+/* Bulk Checkbox on Cards */
+.card-bulk-checkbox-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+}
+
+.card-bulk-checkbox {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  cursor: pointer;
+  accent-color: var(--primary-color);
+}
+
+.card-compact .card-bulk-checkbox {
+  margin-right: 4px;
+}
+
+/* Auto Fetch Metadata Control in Link Modal */
+.auto-fetch-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.auto-fetch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(37, 99, 235, 0.3);
+  background-color: rgba(37, 99, 235, 0.08);
+  color: var(--primary-color);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.auto-fetch-btn:hover:not(:disabled) {
+  background-color: rgba(37, 99, 235, 0.18);
+  border-color: var(--primary-color);
+}
+
+.auto-fetch-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.auto-fetch-success-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.74rem;
+  color: #10b981;
+  background-color: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  padding: 2px 8px;
+  border-radius: 12px;
+  animation: fadeIn 0.2s ease;
+}
+
+/* Bulk Dropdown Menu for Category Move */
+.bulk-dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 6px;
+  min-width: 190px;
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+  padding: 6px;
+  z-index: 105;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bulk-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font-size: 0.84rem;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+  transition: background-color 0.15s ease;
+}
+
+.bulk-dropdown-item:hover {
+  background-color: var(--bg-color);
+  color: var(--primary-color);
+}
+
+/* ========================================================
+   LAST CLICKED TIMESTAMP BADGE STYLING
+   ======================================================== */
+.last-clicked-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background-color: var(--bg-color);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-weight: 500;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.last-clicked-badge i {
+  font-size: 0.68rem;
+  opacity: 0.85;
+}
+
+.last-clicked-badge.has-clicked {
+  color: #6366f1;
+  border-color: rgba(99, 102, 241, 0.25);
+  background-color: rgba(99, 102, 241, 0.08);
+}
+
+[data-theme="dark"] .last-clicked-badge.has-clicked {
+  color: #a5b4fc;
+  border-color: rgba(165, 180, 252, 0.25);
+  background-color: rgba(99, 102, 241, 0.18);
+}
+
+.last-clicked-badge.never-clicked {
+  opacity: 0.7;
+}
+
+.last-clicked-badge.compact {
+  font-size: 0.7rem;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+
 
 

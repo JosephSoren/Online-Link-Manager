@@ -7,8 +7,7 @@ service cloud.firestore {
       allow create, delete: if request.auth != null && request.auth.uid == userId;
       allow update: if (request.auth != null && request.auth.uid == userId) ||
         (resource.data.isPublic == true &&
-         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['clickCount']) &&
-         request.resource.data.clickCount is number);
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['clickCount', 'lastClickedAt']));
     }
     
     // User profile doc and usernames mapping

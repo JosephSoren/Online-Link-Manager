@@ -27,6 +27,7 @@ import { auth, googleProvider, db } from './firebase';
 import jsPDF from 'jspdf';
 import { QrCodeModal } from './components/QrCodeModal';
 import { LandingPage } from './components/LandingPage';
+import { BulkImportModal } from './components/BulkImportModal';
 import {
   ProfileTheme,
   PROFILE_THEMES,
@@ -56,6 +57,7 @@ export interface LinkItem {
   order?: number;
   clickCount?: number;
   isHighlighted?: boolean;
+  lastClickedAt?: string;
 }
 
 export interface PublicUserProfile {
@@ -82,10 +84,11 @@ const INITIAL_LINKS: LinkItem[] = [
     category: 'Tools',
     description: 'Quick web access for inquiries and searching.',
     createdAt: new Date(Date.now() - 60000).toISOString(),
+    lastClickedAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
     isPublic: true,
     isFavorite: true,
     order: 0,
-    clickCount: 0,
+    clickCount: 12,
     isHighlighted: true,
   },
   {
@@ -95,12 +98,41 @@ const INITIAL_LINKS: LinkItem[] = [
     category: 'Work',
     description: 'Source code management and version control.',
     createdAt: new Date().toISOString(),
+    lastClickedAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
     isPublic: true,
     isFavorite: false,
     order: 1,
-    clickCount: 0,
+    clickCount: 5,
   }
 ];
+
+// Helper to format 'Last Clicked' timestamp in an intuitive human-readable way
+const formatLastClicked = (dateStr?: string): string => {
+  if (!dateStr) return 'Never clicked';
+  try {
+    const date = new Date(dateStr);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    if (isNaN(diffMs) || diffMs < 0) return 'Just now';
+
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return 'Just now';
+
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+
+    const diffHours = Math.floor(diffMin / 60);
+    if (diffHours < 24) return `${diffHours}h ago`;
+
+    const diffDays = Math.floor(diffHours / 24);
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays < 7) return `${diffDays}d ago`;
+
+    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  } catch {
+    return 'Recently';
+  }
+};
 
 // Default categories
 const DEFAULT_CATEGORIES = ['Work', 'Social', 'Tools', 'Reading', 'Personal'];
@@ -343,6 +375,20 @@ export default function App() {
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [linkToDelete, setLinkToDelete] = useState<LinkItem | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+
+  // Bulk Selection Mode State
+  const [isBulkMode, setIsBulkMode] = useState(false);
+  const [selectedLinkIds, setSelectedLinkIds] = useState<Set<string>>(new Set());
+  const [isBulkCategoryDropdownOpen, setIsBulkCategoryDropdownOpen] = useState(false);
+  const [isBulkDeleteConfirmOpen, setIsBulkDeleteConfirmOpen] = useState(false);
+  const [isBulkUpdating, setIsBulkUpdating] = useState(false);
+
+  // Bulk Import Modal State (.txt, .pdf, images)
+  const [isBulkImportModalOpen, setIsBulkImportModalOpen] = useState(false);
+
+  // Auto-Fetch Title and Description State
+  const [isFetchingMetadata, setIsFetchingMetadata] = useState(false);
+  const [metadataFetchSuccess, setMetadataFetchSuccess] = useState(false);
 
   // Share to Public Modal
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
@@ -1182,6 +1228,31 @@ export default function App() {
     });
   };
 
+  // Track and update 'Last Clicked' timestamp when user accesses bookmark
+  const handleRecordClick = async (link: LinkItem) => {
+    const now = new Date().toISOString();
+    const updated = links.map((l) =>
+      l.id === link.id
+        ? { ...l, lastClickedAt: now, clickCount: (l.clickCount || 0) + 1 }
+        : l
+    );
+    setLinks(updated);
+
+    if (currentUser) {
+      try {
+        const linkRef = doc(db, 'users', currentUser.uid, 'links', link.id);
+        await updateDoc(linkRef, {
+          lastClickedAt: now,
+          clickCount: increment(1),
+        });
+      } catch (err) {
+        console.warn('Error recording click timestamp:', err);
+      }
+    } else {
+      saveLocalLinks(updated);
+    }
+  };
+
   // Open add/edit modal
   const handleOpenAddModal = () => {
     setEditingLink(null);
@@ -1197,6 +1268,8 @@ export default function App() {
     setFormIsHighlighted(false);
     setIsAddingCustomCategoryInModal(false);
     setModalNewCategoryText('');
+    setIsFetchingMetadata(false);
+    setMetadataFetchSuccess(false);
     setIsLinkModalOpen(true);
   };
 
@@ -1214,7 +1287,252 @@ export default function App() {
     setFormIsHighlighted(Boolean(link.isHighlighted));
     setIsAddingCustomCategoryInModal(false);
     setModalNewCategoryText('');
+    setIsFetchingMetadata(false);
+    setMetadataFetchSuccess(false);
     setIsLinkModalOpen(true);
+  };
+
+  // Automatically fetch title, description, and suggested category from URL
+  const handleAutoFetchMetadata = async (explicitUrl?: string) => {
+    const rawUrl = (explicitUrl || formUrl).trim();
+    if (!rawUrl) {
+      setThumbnailError('Please enter a website URL first to fetch title and description.');
+      return;
+    }
+
+    setIsFetchingMetadata(true);
+    setMetadataFetchSuccess(false);
+
+    try {
+      const res = await fetch('/api/fetch-metadata', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url: rawUrl }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        if (data.title && (!formTitle.trim() || explicitUrl)) {
+          setFormTitle(data.title);
+        }
+        if (data.description && (!formDescription.trim() || explicitUrl)) {
+          setFormDescription(data.description);
+        }
+        if (data.category && (formCategory === 'Work' || !formCategory || explicitUrl)) {
+          if (allCategories.includes(data.category)) {
+            setFormCategory(data.category);
+          }
+        }
+        setMetadataFetchSuccess(true);
+        setTimeout(() => setMetadataFetchSuccess(false), 4000);
+      }
+    } catch (err: any) {
+      console.warn('Metadata fetch error:', err);
+    } finally {
+      setIsFetchingMetadata(false);
+    }
+  };
+
+  // Toggle bulk selection mode
+  const handleToggleBulkMode = () => {
+    setIsBulkMode((prev) => {
+      const next = !prev;
+      if (!next) {
+        setSelectedLinkIds(new Set());
+        setIsBulkCategoryDropdownOpen(false);
+      }
+      return next;
+    });
+  };
+
+  // Toggle individual link selection in bulk mode
+  const handleToggleSelectLink = (id: string) => {
+    setSelectedLinkIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  // Select all filtered links
+  const handleSelectAllFiltered = () => {
+    setSelectedLinkIds(new Set(filteredLinks.map((l) => l.id)));
+  };
+
+  // Deselect all links
+  const handleDeselectAll = () => {
+    setSelectedLinkIds(new Set());
+  };
+
+  // Bulk move selected links to a category
+  const handleBulkMoveCategory = async (targetCategory: string) => {
+    if (selectedLinkIds.size === 0) return;
+    setIsBulkUpdating(true);
+
+    try {
+      const count = selectedLinkIds.size;
+      const updated = links.map((l) =>
+        selectedLinkIds.has(l.id) ? { ...l, category: targetCategory } : l
+      );
+      setLinks(updated);
+
+      if (currentUser) {
+        const batch = writeBatch(db);
+        selectedLinkIds.forEach((id) => {
+          const ref = doc(db, 'users', currentUser.uid, 'links', id);
+          batch.update(ref, { category: targetCategory });
+        });
+        await batch.commit();
+      } else {
+        saveLocalLinks(updated);
+      }
+
+      setCopyNotification(`Moved ${count} ${count === 1 ? 'link' : 'links'} to "${targetCategory}"`);
+      setTimeout(() => setCopyNotification(null), 2500);
+      setSelectedLinkIds(new Set());
+      setIsBulkCategoryDropdownOpen(false);
+    } catch (err) {
+      console.error('Bulk move error:', err);
+      setCopyNotification('Failed to move selected links');
+      setTimeout(() => setCopyNotification(null), 2500);
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  };
+
+  // Bulk toggle or set public status
+  const handleBulkTogglePublic = async (forcePublic?: boolean) => {
+    if (selectedLinkIds.size === 0) return;
+    setIsBulkUpdating(true);
+
+    try {
+      const count = selectedLinkIds.size;
+      const updated = links.map((l) => {
+        if (selectedLinkIds.has(l.id)) {
+          const newStatus = forcePublic !== undefined ? forcePublic : !l.isPublic;
+          return { ...l, isPublic: newStatus };
+        }
+        return l;
+      });
+      setLinks(updated);
+
+      if (currentUser) {
+        const batch = writeBatch(db);
+        selectedLinkIds.forEach((id) => {
+          const ref = doc(db, 'users', currentUser.uid, 'links', id);
+          const item = updated.find((l) => l.id === id);
+          if (item) {
+            batch.update(ref, { isPublic: item.isPublic });
+          }
+        });
+        await batch.commit();
+      } else {
+        saveLocalLinks(updated);
+      }
+
+      const statusText = forcePublic === true ? 'Public' : forcePublic === false ? 'Private' : 'visibility';
+      setCopyNotification(`Updated ${count} ${count === 1 ? 'link' : 'links'} to ${statusText}`);
+      setTimeout(() => setCopyNotification(null), 2500);
+      setSelectedLinkIds(new Set());
+    } catch (err) {
+      console.error('Bulk public toggle error:', err);
+      setCopyNotification('Failed to update public status');
+      setTimeout(() => setCopyNotification(null), 2500);
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  };
+
+  // Bulk delete confirmation handler
+  const handleBulkDeleteConfirm = async () => {
+    if (selectedLinkIds.size === 0) return;
+    setIsBulkUpdating(true);
+
+    try {
+      const count = selectedLinkIds.size;
+      const updated = links.filter((l) => !selectedLinkIds.has(l.id));
+      setLinks(updated);
+
+      if (currentUser) {
+        const batch = writeBatch(db);
+        selectedLinkIds.forEach((id) => {
+          const ref = doc(db, 'users', currentUser.uid, 'links', id);
+          batch.delete(ref);
+        });
+        await batch.commit();
+      } else {
+        saveLocalLinks(updated);
+      }
+
+      setCopyNotification(`Deleted ${count} ${count === 1 ? 'link' : 'links'}`);
+      setTimeout(() => setCopyNotification(null), 2500);
+      setSelectedLinkIds(new Set());
+      setIsBulkDeleteConfirmOpen(false);
+    } catch (err) {
+      console.error('Bulk delete error:', err);
+      setCopyNotification('Failed to delete selected links');
+      setTimeout(() => setCopyNotification(null), 2500);
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  };
+
+  // Bulk import multiple links (.txt, .pdf, images, text)
+  const handleBulkImportLinks = async (
+    newLinks: Array<{
+      title: string;
+      url: string;
+      category: string;
+      description?: string;
+      isPublic?: boolean;
+    }>
+  ) => {
+    if (currentUser) {
+      const batch = writeBatch(db);
+      newLinks.forEach((item, index) => {
+        const newRef = doc(collection(db, 'users', currentUser.uid, 'links'));
+        batch.set(newRef, {
+          title: item.title,
+          url: item.url,
+          category: item.category,
+          description: item.description || '',
+          thumbnail: '',
+          isPublic: Boolean(item.isPublic),
+          isFavorite: false,
+          isHighlighted: false,
+          order: index,
+          clickCount: 0,
+          createdAt: new Date(Date.now() + index * 20).toISOString(),
+        });
+      });
+      await batch.commit();
+    } else {
+      const createdItems: LinkItem[] = newLinks.map((item, index) => ({
+        id: `${Date.now()}-${index}`,
+        title: item.title,
+        url: item.url,
+        category: item.category,
+        description: item.description || '',
+        thumbnail: undefined,
+        isPublic: Boolean(item.isPublic),
+        isFavorite: false,
+        isHighlighted: false,
+        order: index,
+        clickCount: 0,
+        createdAt: new Date(Date.now() + index * 20).toISOString(),
+      }));
+      const updated = [...createdItems, ...links];
+      saveLocalLinks(updated);
+      setLinks(updated);
+    }
+    setCopyNotification(`Successfully imported ${newLinks.length} ${newLinks.length === 1 ? 'link' : 'links'}!`);
+    setTimeout(() => setCopyNotification(null), 3500);
   };
 
   // Generate preview thumbnail using Gemini AI
@@ -1615,11 +1933,12 @@ export default function App() {
     const nextCount = currentCount + 1;
 
     // Optimistically update link state in publicLinks and links
+    const now = new Date().toISOString();
     setPublicLinks((prev) =>
-      prev.map((l) => (l.id === link.id ? { ...l, clickCount: nextCount } : l))
+      prev.map((l) => (l.id === link.id ? { ...l, clickCount: nextCount, lastClickedAt: now } : l))
     );
     setLinks((prev) =>
-      prev.map((l) => (l.id === link.id ? { ...l, clickCount: nextCount } : l))
+      prev.map((l) => (l.id === link.id ? { ...l, clickCount: nextCount, lastClickedAt: now } : l))
     );
 
     // Persist increment in Firestore
@@ -1629,6 +1948,7 @@ export default function App() {
         const linkRef = doc(db, 'users', targetUid, 'links', link.id);
         await updateDoc(linkRef, {
           clickCount: increment(1),
+          lastClickedAt: now,
         });
       } catch (err) {
         console.warn('Click count Firestore tracking error:', err);
@@ -1640,7 +1960,7 @@ export default function App() {
         if (localData) {
           const parsed: LinkItem[] = JSON.parse(localData);
           const updated = parsed.map((l) =>
-            l.id === link.id ? { ...l, clickCount: nextCount } : l
+            l.id === link.id ? { ...l, clickCount: nextCount, lastClickedAt: now } : l
           );
           localStorage.setItem('linkmanager_data', JSON.stringify(updated));
         }
@@ -2488,6 +2808,9 @@ export default function App() {
             </ul>
 
             <div className="sidebar-footer" id="sidebarFooter">
+              <button id="sidebarBulkImportBtn" className="btn btn-outline-sm" onClick={() => setIsBulkImportModalOpen(true)} title="Bulk import links from .txt, .pdf, or image">
+                <i className="fa-solid fa-file-arrow-up" style={{ color: 'var(--primary-color)' }}></i> Bulk Import
+              </button>
               <button id="exportPdfBtn" className="btn btn-outline-sm" onClick={handleExportPDF} title="Export bookmarks as a PDF document">
                 <i className="fa-solid fa-file-pdf" style={{ color: '#ef4444' }}></i> Export PDF
               </button>
@@ -2557,6 +2880,33 @@ export default function App() {
                   </button>
                 </div>
 
+                {/* Bulk Import Button */}
+                <button
+                  id="headerBulkImportBtn"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                  onClick={() => setIsBulkImportModalOpen(true)}
+                  title="Import multiple links from .txt, .pdf documents or images"
+                >
+                  <i className="fa-solid fa-file-arrow-up" style={{ color: 'var(--primary-color)' }}></i> Bulk Import
+                </button>
+
+                {/* Bulk Selection Mode Toggle Button */}
+                <button
+                  id="headerBulkSelectBtn"
+                  className={`btn ${isBulkMode ? 'btn-primary' : 'btn-secondary'}`}
+                  style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                  onClick={handleToggleBulkMode}
+                  title={isBulkMode ? 'Exit Bulk Selection Mode' : 'Select multiple links for bulk delete, move, or visibility toggle'}
+                >
+                  <i className="fa-solid fa-list-check"></i> {isBulkMode ? 'Done Selecting' : 'Bulk Select'}
+                  {isBulkMode && selectedLinkIds.size > 0 && (
+                    <span style={{ marginLeft: '6px', background: 'rgba(255,255,255,0.25)', padding: '1px 7px', borderRadius: '10px', fontSize: '0.74rem' }}>
+                      {selectedLinkIds.size}
+                    </span>
+                  )}
+                </button>
+
                 <button
                   id="shareCurrentCategoryBtn"
                   className="btn btn-secondary"
@@ -2607,6 +2957,26 @@ export default function App() {
                   {/* Three Dots Dropdown Menu */}
                   {isHeaderMenuOpen && (
                     <div className="dropdown-menu" id="headerDropdownMenu">
+                      <button
+                        className="dropdown-item"
+                        id="menuBulkImportBtn"
+                        onClick={() => {
+                          setIsHeaderMenuOpen(false);
+                          setIsBulkImportModalOpen(true);
+                        }}
+                      >
+                        <i className="fa-solid fa-file-arrow-up" style={{ color: 'var(--primary-color)' }}></i> Bulk Import (.txt, .pdf, image)
+                      </button>
+                      <button
+                        className="dropdown-item"
+                        id="menuBulkSelectBtn"
+                        onClick={() => {
+                          setIsHeaderMenuOpen(false);
+                          handleToggleBulkMode();
+                        }}
+                      >
+                        <i className="fa-solid fa-list-check" style={{ color: '#8b5cf6' }}></i> {isBulkMode ? 'Exit Bulk Mode' : 'Bulk Select Links'}
+                      </button>
                       <button
                         className="dropdown-item"
                         id="menuLinkSettingsBtn"
@@ -2678,6 +3048,126 @@ export default function App() {
               </div>
             </div>
 
+            {/* Floating Bulk Actions Bar when Bulk Mode is active */}
+            {isBulkMode && (
+              <div className="bulk-actions-floating-bar" id="bulkActionsFloatingBar">
+                <div className="bulk-actions-left">
+                  <label className="bulk-select-all-label">
+                    <input
+                      type="checkbox"
+                      className="card-bulk-checkbox"
+                      checked={selectedLinkIds.size === filteredLinks.length && filteredLinks.length > 0}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          handleSelectAllFiltered();
+                        } else {
+                          handleDeselectAll();
+                        }
+                      }}
+                    />
+                    <span>Select All ({filteredLinks.length})</span>
+                  </label>
+                  <span className="bulk-count-badge">
+                    {selectedLinkIds.size} of {filteredLinks.length} selected
+                  </span>
+                </div>
+
+                <div className="bulk-actions-right">
+                  {/* Move to Category Popover */}
+                  <div style={{ position: 'relative' }}>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                      disabled={selectedLinkIds.size === 0 || isBulkUpdating}
+                      onClick={() => setIsBulkCategoryDropdownOpen(!isBulkCategoryDropdownOpen)}
+                    >
+                      <i className="fa-solid fa-folder-tree" style={{ color: 'var(--primary-color)' }}></i> Move to Category{' '}
+                      <i className="fa-solid fa-chevron-down" style={{ fontSize: '0.7rem', marginLeft: '4px' }}></i>
+                    </button>
+
+                    {isBulkCategoryDropdownOpen && (
+                      <div className="bulk-dropdown-menu">
+                        <span style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-secondary)', padding: '4px 10px', textTransform: 'uppercase' }}>
+                          Choose Destination:
+                        </span>
+                        {allCategories.map((cat) => (
+                          <button
+                            key={cat}
+                            type="button"
+                            className="bulk-dropdown-item"
+                            onClick={() => {
+                              setIsBulkCategoryDropdownOpen(false);
+                              handleBulkMoveCategory(cat);
+                            }}
+                          >
+                            <i className="fa-solid fa-folder" style={{ color: 'var(--primary-color)', fontSize: '0.85rem' }}></i>
+                            <span>{cat}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Toggle Public / Private */}
+                  <div style={{ display: 'inline-flex', borderRadius: '6px', overflow: 'hidden', border: '1px solid var(--border-color)' }}>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.82rem', padding: '6px 10px', borderRadius: 0, border: 'none' }}
+                      disabled={selectedLinkIds.size === 0 || isBulkUpdating}
+                      onClick={() => handleBulkTogglePublic(true)}
+                      title="Make all selected links public"
+                    >
+                      <i className="fa-solid fa-globe" style={{ color: '#10b981' }}></i> Make Public
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.82rem', padding: '6px 10px', borderRadius: 0, border: 'none', borderLeft: '1px solid var(--border-color)' }}
+                      disabled={selectedLinkIds.size === 0 || isBulkUpdating}
+                      onClick={() => handleBulkTogglePublic(false)}
+                      title="Make all selected links private"
+                    >
+                      <i className="fa-solid fa-lock" style={{ color: 'var(--text-secondary)' }}></i> Make Private
+                    </button>
+                  </div>
+
+                  {/* Delete Selected */}
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ fontSize: '0.82rem', padding: '6px 12px', color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.3)' }}
+                    disabled={selectedLinkIds.size === 0 || isBulkUpdating}
+                    onClick={() => setIsBulkDeleteConfirmOpen(true)}
+                  >
+                    <i className="fa-regular fa-trash-can"></i> Delete ({selectedLinkIds.size})
+                  </button>
+
+                  {/* Deselect / Exit */}
+                  {selectedLinkIds.size > 0 && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.82rem', padding: '6px 10px' }}
+                      onClick={handleDeselectAll}
+                    >
+                      Deselect
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    style={{ fontSize: '0.82rem', padding: '6px 12px' }}
+                    onClick={handleToggleBulkMode}
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Link Cards Grid Container (Drag and Drop Reordering, Favorite Pinned, Only Copy & Open Link icon) */}
             <div className={`links-grid ${isCompactView ? 'compact-mode' : ''}`} id="linksGrid">
               {filteredLinks.map((link) => {
@@ -2687,18 +3177,30 @@ export default function App() {
                 if (isCompactView) {
                   return (
                     <div
-                      className={`card card-compact ${link.isFavorite ? 'is-favorite' : ''} ${draggedLinkId === link.id ? 'is-dragging' : ''} ${dragOverLinkId === link.id ? 'drag-over' : ''}`}
+                      className={`card card-compact ${link.isFavorite ? 'is-favorite' : ''} ${selectedLinkIds.has(link.id) ? 'is-bulk-selected' : ''} ${draggedLinkId === link.id ? 'is-dragging' : ''} ${dragOverLinkId === link.id ? 'drag-over' : ''}`}
                       key={link.id}
                       id={`card-${link.id}`}
-                      draggable={draggableCardId === link.id}
-                      onDragStart={(e) => handleDragStart(e, link.id)}
-                      onDragOver={(e) => handleDragOver(e, link.id)}
-                      onDragLeave={(e) => handleDragLeave(e, link.id)}
-                      onDrop={(e) => handleDrop(e, link.id)}
-                      onDragEnd={handleDragEnd}
+                      draggable={!isBulkMode && draggableCardId === link.id}
+                      onClick={isBulkMode ? () => handleToggleSelectLink(link.id) : undefined}
+                      style={isBulkMode ? { cursor: 'pointer' } : undefined}
+                      onDragStart={(e) => !isBulkMode && handleDragStart(e, link.id)}
+                      onDragOver={(e) => !isBulkMode && handleDragOver(e, link.id)}
+                      onDragLeave={(e) => !isBulkMode && handleDragLeave(e, link.id)}
+                      onDrop={(e) => !isBulkMode && handleDrop(e, link.id)}
+                      onDragEnd={!isBulkMode ? handleDragEnd : undefined}
                     >
-                      {/* Left: Icon + Title & Domain */}
+                      {/* Left: Checkbox (if bulk) + Icon + Title & Domain */}
                       <div className="card-compact-left">
+                        {isBulkMode && (
+                          <div className="card-bulk-checkbox-container" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              className="card-bulk-checkbox"
+                              checked={selectedLinkIds.has(link.id)}
+                              onChange={() => handleToggleSelectLink(link.id)}
+                            />
+                          </div>
+                        )}
                         <img
                           src={faviconUrl}
                           className="favicon compact-favicon"
@@ -2716,6 +3218,13 @@ export default function App() {
                               className="card-title-link"
                               id={`cardTitleLink-${link.id}`}
                               title={`Open ${link.title}`}
+                              onClick={(e) => {
+                                if (isBulkMode) {
+                                  e.stopPropagation();
+                                } else {
+                                  handleRecordClick(link);
+                                }
+                              }}
                             >
                               <h4 className="compact-title">{link.title}</h4>
                             </a>
@@ -2726,6 +3235,21 @@ export default function App() {
                                   <i className="fa-solid fa-bolt"></i> Spotlight
                                 </span>
                               )}
+
+                              {/* Last Clicked Timestamp badge */}
+                              <span
+                                className={`last-clicked-badge compact ${link.lastClickedAt ? 'has-clicked' : 'never-clicked'}`}
+                                id={`compactLastClickedBadge-${link.id}`}
+                                title={
+                                  link.lastClickedAt
+                                    ? `Last accessed: ${new Date(link.lastClickedAt).toLocaleString()}`
+                                    : 'Not accessed yet'
+                                }
+                              >
+                                <i className="fa-regular fa-clock"></i>
+                                <span>{formatLastClicked(link.lastClickedAt)}</span>
+                              </span>
+
                               {link.isPublic && (
                                 <span
                                   className="click-count-badge compact"
@@ -2744,7 +3268,10 @@ export default function App() {
                       <div className="card-compact-actions">
                         <button
                           id={`copyBtn-${link.id}`}
-                          onClick={() => copyToClipboard(link.url)}
+                          onClick={(e) => {
+                            if (isBulkMode) e.stopPropagation();
+                            copyToClipboard(link.url);
+                          }}
                           title="Copy URL"
                           className="compact-action-btn"
                           aria-label="Copy URL"
@@ -2759,6 +3286,13 @@ export default function App() {
                           title="Open Link in New Tab"
                           className="compact-action-btn"
                           aria-label="Open Link"
+                          onClick={(e) => {
+                            if (isBulkMode) {
+                              e.stopPropagation();
+                            } else {
+                              handleRecordClick(link);
+                            }
+                          }}
                         >
                           <i className="fa-solid fa-arrow-up-right-from-square"></i>
                         </a>
@@ -2769,29 +3303,42 @@ export default function App() {
 
                 return (
                   <div
-                    className={`card ${link.isFavorite ? 'is-favorite' : ''} ${draggedLinkId === link.id ? 'is-dragging' : ''} ${dragOverLinkId === link.id ? 'drag-over' : ''}`}
+                    className={`card ${link.isFavorite ? 'is-favorite' : ''} ${selectedLinkIds.has(link.id) ? 'is-bulk-selected' : ''} ${draggedLinkId === link.id ? 'is-dragging' : ''} ${dragOverLinkId === link.id ? 'drag-over' : ''}`}
                     key={link.id}
                     id={`card-${link.id}`}
-                    draggable={draggableCardId === link.id}
-                    onDragStart={(e) => handleDragStart(e, link.id)}
-                    onDragOver={(e) => handleDragOver(e, link.id)}
-                    onDragLeave={(e) => handleDragLeave(e, link.id)}
-                    onDrop={(e) => handleDrop(e, link.id)}
-                    onDragEnd={handleDragEnd}
+                    draggable={!isBulkMode && draggableCardId === link.id}
+                    onClick={isBulkMode ? () => handleToggleSelectLink(link.id) : undefined}
+                    style={isBulkMode ? { cursor: 'pointer' } : undefined}
+                    onDragStart={(e) => !isBulkMode && handleDragStart(e, link.id)}
+                    onDragOver={(e) => !isBulkMode && handleDragOver(e, link.id)}
+                    onDragLeave={(e) => !isBulkMode && handleDragLeave(e, link.id)}
+                    onDrop={(e) => !isBulkMode && handleDrop(e, link.id)}
+                    onDragEnd={!isBulkMode ? handleDragEnd : undefined}
                   >
-                    {/* Card Top Control Bar: Drag Handle & Favorite Pin Star */}
+                    {/* Card Top Control Bar: Bulk Checkbox or Drag Handle & Favorite Pin Star */}
                     <div className="card-top-controls" id={`cardTopControls-${link.id}`}>
-                      <div
-                        className="card-drag-handle"
-                        id={`dragHandle-${link.id}`}
-                        title="Drag to reorder card"
-                        onMouseEnter={() => setDraggableCardId(link.id)}
-                        onMouseLeave={() => {
-                          if (!draggedLinkId) setDraggableCardId(null);
-                        }}
-                      >
-                        <i className="fa-solid fa-grip-vertical"></i>
-                      </div>
+                      {isBulkMode ? (
+                        <div className="card-bulk-checkbox-container" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            className="card-bulk-checkbox"
+                            checked={selectedLinkIds.has(link.id)}
+                            onChange={() => handleToggleSelectLink(link.id)}
+                          />
+                        </div>
+                      ) : (
+                        <div
+                          className="card-drag-handle"
+                          id={`dragHandle-${link.id}`}
+                          title="Drag to reorder card"
+                          onMouseEnter={() => setDraggableCardId(link.id)}
+                          onMouseLeave={() => {
+                            if (!draggedLinkId) setDraggableCardId(null);
+                          }}
+                        >
+                          <i className="fa-solid fa-grip-vertical"></i>
+                        </div>
+                      )}
                       <button
                         type="button"
                         className={`favorite-star-btn ${link.isFavorite ? 'is-active' : ''}`}
@@ -2826,6 +3373,13 @@ export default function App() {
                             className="card-title-link"
                             id={`cardTitleLink-${link.id}`}
                             title={`Open ${link.title}`}
+                            onClick={(e) => {
+                              if (isBulkMode) {
+                                e.stopPropagation();
+                              } else {
+                                handleRecordClick(link);
+                              }
+                            }}
                           >
                             <h4>{link.title}</h4>
                           </a>
@@ -2844,6 +3398,21 @@ export default function App() {
                             <i className="fa-solid fa-bolt"></i> Spotlight
                           </span>
                         )}
+
+                        {/* Last Clicked Timestamp badge */}
+                        <span
+                          className={`last-clicked-badge ${link.lastClickedAt ? 'has-clicked' : 'never-clicked'}`}
+                          id={`lastClickedBadge-${link.id}`}
+                          title={
+                            link.lastClickedAt
+                              ? `Last accessed: ${new Date(link.lastClickedAt).toLocaleString()}`
+                              : 'This bookmark has not been clicked yet'
+                          }
+                        >
+                          <i className="fa-regular fa-clock"></i>
+                          <span>{link.lastClickedAt ? `Clicked ${formatLastClicked(link.lastClickedAt)}` : 'Never clicked'}</span>
+                        </span>
+
                         {link.isPublic && (
                           <span
                             className="badge"
@@ -2888,6 +3457,7 @@ export default function App() {
                           target="_blank"
                           rel="noopener noreferrer"
                           title="Open Link in New Tab"
+                          onClick={() => handleRecordClick(link)}
                         >
                           <i className="fa-solid fa-arrow-up-right-from-square"></i>
                         </a>
@@ -4099,6 +4669,17 @@ export default function App() {
                           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                             <h4 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 600 }}>{link.title}</h4>
                             <span className="badge" style={{ fontSize: '0.7rem', padding: '2px 8px' }}>{link.category}</span>
+                            <span
+                              className={`last-clicked-badge compact ${link.lastClickedAt ? 'has-clicked' : 'never-clicked'}`}
+                              title={
+                                link.lastClickedAt
+                                  ? `Last accessed: ${new Date(link.lastClickedAt).toLocaleString()}`
+                                  : 'Never accessed yet'
+                              }
+                            >
+                              <i className="fa-regular fa-clock"></i>
+                              <span>{formatLastClicked(link.lastClickedAt)}</span>
+                            </span>
                           </div>
                           <span className="domain-tag" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
                             {link.url}
@@ -4168,6 +4749,7 @@ export default function App() {
                             rel="noopener noreferrer"
                             title="Open link"
                             style={{ padding: '6px 10px', textDecoration: 'none' }}
+                            onClick={() => handleRecordClick(link)}
                           >
                             <i className="fa-solid fa-arrow-up-right-from-square"></i>
                           </a>
@@ -4999,7 +5581,98 @@ export default function App() {
                 &times;
               </button>
             </div>
+
+            {/* Quick Bulk Import helper banner */}
+            {!editingLink && (
+              <div
+                style={{
+                  margin: '0 24px 14px 24px',
+                  padding: '8px 12px',
+                  backgroundColor: 'rgba(37, 99, 235, 0.08)',
+                  borderRadius: '8px',
+                  border: '1px solid rgba(37, 99, 235, 0.2)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '8px',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <i className="fa-solid fa-file-import" style={{ color: 'var(--primary-color)', fontSize: '0.9rem' }}></i>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                    Have multiple links in a <strong>.txt</strong>, <strong>.pdf</strong>, or screenshot image?
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.75rem', padding: '3px 9px', whiteSpace: 'nowrap' }}
+                  onClick={() => {
+                    setIsLinkModalOpen(false);
+                    setIsBulkImportModalOpen(true);
+                  }}
+                >
+                  Bulk Import
+                </button>
+              </div>
+            )}
+
             <form id="linkForm" onSubmit={handleSaveLink}>
+              <div className="form-group">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                  <label htmlFor="linkUrl" style={{ margin: 0 }}>Website URL</label>
+                  <span style={{ fontSize: '0.74rem', color: 'var(--text-secondary)' }}>
+                    Paste a link to auto-fill title & description
+                  </span>
+                </div>
+                <input
+                  type="text"
+                  id="linkUrl"
+                  placeholder="https://github.com or nytimes.com"
+                  required
+                  value={formUrl}
+                  onChange={(e) => setFormUrl(e.target.value)}
+                  onPaste={(e) => {
+                    const pasted = e.clipboardData.getData('text');
+                    if (pasted && (pasted.startsWith('http://') || pasted.startsWith('https://') || pasted.includes('.'))) {
+                      const cleanUrl = pasted.trim();
+                      setFormUrl(cleanUrl);
+                      if (!formTitle.trim()) {
+                        handleAutoFetchMetadata(cleanUrl);
+                      }
+                    }
+                  }}
+                />
+
+                {/* Auto-Fetch Metadata Button & Status Badge */}
+                <div className="auto-fetch-container">
+                  <button
+                    type="button"
+                    className="auto-fetch-btn"
+                    onClick={() => handleAutoFetchMetadata()}
+                    disabled={isFetchingMetadata || !formUrl.trim()}
+                    title="Automatically fetch title, description, and suggested category from website"
+                  >
+                    {isFetchingMetadata ? (
+                      <>
+                        <i className="fa-solid fa-spinner fa-spin"></i>
+                        <span>Fetching website info...</span>
+                      </>
+                    ) : (
+                      <>
+                        <i className="fa-solid fa-wand-magic-sparkles"></i>
+                        <span>Auto-Fetch Title & Description</span>
+                      </>
+                    )}
+                  </button>
+                  {metadataFetchSuccess && (
+                    <span className="auto-fetch-success-pill">
+                      <i className="fa-solid fa-check"></i> Details retrieved!
+                    </span>
+                  )}
+                </div>
+              </div>
+
               <div className="form-group">
                 <label htmlFor="linkTitle">Title</label>
                 <input
@@ -5009,17 +5682,6 @@ export default function App() {
                   required
                   value={formTitle}
                   onChange={(e) => setFormTitle(e.target.value)}
-                />
-              </div>
-              <div className="form-group">
-                <label htmlFor="linkUrl">URL</label>
-                <input
-                  type="text"
-                  id="linkUrl"
-                  placeholder="https://github.com"
-                  required
-                  value={formUrl}
-                  onChange={(e) => setFormUrl(e.target.value)}
                 />
               </div>
               <div className="form-group">
@@ -5844,6 +6506,66 @@ export default function App() {
         subtitle={qrModalData.subtitle}
         categoryBadge={qrModalData.categoryBadge}
       />
+
+      {/* Modal Dialog: Bulk Import Links (.txt, .pdf, images, text) */}
+      <BulkImportModal
+        isOpen={isBulkImportModalOpen}
+        onClose={() => setIsBulkImportModalOpen(false)}
+        onImportLinks={handleBulkImportLinks}
+        availableCategories={allCategories}
+        defaultCategory={currentCategory !== 'All' && currentCategory !== 'Favorites' ? currentCategory : 'Work'}
+      />
+
+      {/* Modal Dialog: Confirm Bulk Delete */}
+      {isBulkDeleteConfirmOpen && (
+        <div className="modal-overlay" style={{ zIndex: 1100 }}>
+          <div className="modal" style={{ maxWidth: '440px' }}>
+            <div style={{ textAlign: 'center', padding: '10px 0' }}>
+              <div
+                style={{
+                  width: '52px',
+                  height: '52px',
+                  borderRadius: '50%',
+                  backgroundColor: 'rgba(239, 68, 68, 0.12)',
+                  color: '#ef4444',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '1.4rem',
+                  marginBottom: '14px',
+                }}
+              >
+                <i className="fa-regular fa-trash-can"></i>
+              </div>
+              <h3 style={{ margin: '0 0 8px 0', fontSize: '1.2rem', fontWeight: 700 }}>
+                Delete {selectedLinkIds.size} Selected {selectedLinkIds.size === 1 ? 'Link' : 'Links'}?
+              </h3>
+              <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--text-secondary)' }}>
+                Are you sure you want to delete these {selectedLinkIds.size} selected items? This action cannot be undone.
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginTop: '22px', justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setIsBulkDeleteConfirmOpen(false)}
+                disabled={isBulkUpdating}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                style={{ backgroundColor: '#ef4444', borderColor: '#ef4444', color: '#fff' }}
+                onClick={handleBulkDeleteConfirm}
+                disabled={isBulkUpdating}
+              >
+                {isBulkUpdating ? 'Deleting...' : `Yes, Delete (${selectedLinkIds.size})`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
